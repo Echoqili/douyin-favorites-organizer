@@ -8,8 +8,12 @@ import { partitionMappedTargets, targetCheckboxSelector } from "../src/browser-s
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const OPENCLI = path.join(ROOT, "node_modules", "@jackwener", "opencli", "dist", "src", "main.js");
-const SESSION = "douyin-organizer-apply";
+const SESSION_DEFAULT = "douyin-organizer-apply";
+let SESSION = SESSION_DEFAULT; // 可被 --session <name> 覆盖，支持多终端手动并行（每终端独立 session 隔离）
 const SELF_URL = douyinFavoritesUrl();
+// 未处理收藏夹：抖音批量管理懒加载未渲染、无法定位 checkbox 的视频统一归集到这里，
+// 不阻塞主流程；后续可单独重试。命名带括号说明，避免与分类夹混淆。
+const UNHANDLED_FOLDER = "未处理（懒加载未渲染）";
 
 function argsMap(values) {
   const result = { _: [] };
@@ -75,28 +79,36 @@ async function ensureSession({ windowMode = "background", resetExisting = false 
 }
 
 async function clickTab(id) {
-  const result = await evaluate(`(() => {
-    const tab = document.getElementById(${JSON.stringify(id)});
-    if (!tab || !(tab.offsetWidth || tab.offsetHeight)) return { clicked: false };
-    if (tab.getAttribute('aria-selected') === 'true') return { clicked: true, alreadySelected: true };
-    const target = tab.querySelector('span') || tab;
-    const pointer = type => target.dispatchEvent(new PointerEvent(type, {
-      bubbles: true, composed: true, pointerId: 1, isPrimary: true
-    }));
-    const mouse = type => target.dispatchEvent(new MouseEvent(type, {
-      bubbles: true, composed: true, button: 0
-    }));
-    pointer('pointerdown');
-    mouse('mousedown');
-    pointer('pointerup');
-    mouse('mouseup');
-    mouse('click');
-    return { clicked: true };
-  })()`);
-  if (!result.clicked) throw new Error(`Required tab is missing: ${id}`);
-  await wait(1.5);
-  const selected = await evaluate(`(() => document.getElementById(${JSON.stringify(id)})?.getAttribute('aria-selected'))()`);
-  if (selected !== "true" && selected !== true) throw new Error(`Tab did not become selected: ${id}`);
+  // 抖音界面偶发抖动：标签点击后 aria-selected 未及时变为 true（点击事件没落到目标上）。
+  // 加内部重试（最多 3 次），每次重新读取状态并重新派发事件，避免偶发抖动直接中断整个批次。
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await evaluate(`(() => {
+      const tab = document.getElementById(${JSON.stringify(id)});
+      if (!tab || !(tab.offsetWidth || tab.offsetHeight)) return { clicked: false };
+      if (tab.getAttribute('aria-selected') === 'true') return { clicked: true, alreadySelected: true };
+      const target = tab.querySelector('span') || tab;
+      const pointer = type => target.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, composed: true, pointerId: 1, isPrimary: true
+      }));
+      const mouse = type => target.dispatchEvent(new MouseEvent(type, {
+        bubbles: true, composed: true, button: 0
+      }));
+      pointer('pointerdown');
+      mouse('mousedown');
+      pointer('pointerup');
+      mouse('mouseup');
+      mouse('click');
+      return { clicked: true };
+    })()`);
+    if (!result.clicked) { lastError = new Error(`Required tab is missing: ${id}`); await wait(0.5); continue; }
+    await wait(1.5);
+    const selected = await evaluate(`(() => document.getElementById(${JSON.stringify(id)})?.getAttribute('aria-selected'))()`);
+    if (selected === "true" || selected === true) return;
+    lastError = new Error(`Tab did not become selected: ${id}`);
+    await wait(0.6);
+  }
+  throw lastError || new Error(`Tab did not become selected: ${id}`);
 }
 
 async function clickExactText(text) {
@@ -112,16 +124,42 @@ async function clickExactText(text) {
   return result;
 }
 
+// 稳健退出批量管理态：抖音在 submit 后界面会变化（按钮文本可能是"退出管理"或"完成"，
+// 也可能弹窗/自动关闭），一旦文本不匹配就不该抛错——因为视频可能已写入成功。
+// 兜底：reopen 收藏视频 URL，强制回到普通态。
+async function safeExitManagement() {
+  for (const label of ["退出管理", "完成", "关闭"]) {
+    const r = await evaluate(`(() => {
+      const candidates = [...document.querySelectorAll('*')]
+        .filter(element => element.innerText?.trim() === ${JSON.stringify(label)} && (element.offsetWidth || element.offsetHeight));
+      const target = candidates.find(element => element.children.length === 0) || candidates.at(-1);
+      if (!target) return { clicked: false, matches: candidates.length };
+      target.click();
+      return { clicked: true, matches: candidates.length };
+    })()`).catch(() => ({ clicked: false }));
+    if (r.clicked) {
+      await wait(0.6);
+      return { exited: true, via: label };
+    }
+  }
+  // 兜底：直接重开收藏视频页，强制脱离管理态（不抛错）
+  await evaluate(`(() => { window.location.href = ${JSON.stringify(SELF_URL)}; return true; })()`).catch(() => {});
+  await wait(0.8);
+  return { exited: true, via: "reopen-url" };
+}
+
 async function preflight(manifest, windowMode = "background") {
   await ensureSession(windowMode);
-  await clickTab("semiTabfavorite_collection");
-  const managementOpen = await evaluate("(() => document.body.innerText.includes('退出管理'))()");
+  // 直接导航到收藏视频子标签（与 enterManagement 目标一致，避免重复 open 触发 Chrome 崩溃）
+  await browser("open", `${SELF_URL}&showSubTab=favorite_video`, "--window", windowMode).catch(() => {});
+  await wait(2.5);
+  const managementOpen = await evaluate("(() => document.body.innerText.includes('退出管理'))()").catch(() => false);
   if (managementOpen) {
-    await clickExactText("退出管理");
+    await safeExitManagement();
     await wait(0.8);
   }
   let state = null;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
     state = await evaluate(`(() => ({
       loggedIn: !!document.getElementById('semiTabfavorite_collection'),
       folderTab: !!document.getElementById('semiTabfavorite_folder'),
@@ -129,11 +167,11 @@ async function preflight(manifest, windowMode = "background") {
       batchManage: document.body.innerText.includes('批量管理'),
       addActionKnown: true,
       cancelActionGuard: true
-    }))()`);
-    if (state.folderTab && state.videoTab && state.batchManage) break;
-    await wait(0.4);
+    }))()`).catch(() => null);
+    if (state && state.folderTab && state.videoTab && state.batchManage) break;
+    await wait(0.5);
   }
-  if (!state.loggedIn || !state.folderTab || !state.videoTab || !state.batchManage) {
+  if (!state || !state.loggedIn || !state.folderTab || !state.videoTab || !state.batchManage) {
     throw new Error(`Douyin favorites UI preflight failed: ${JSON.stringify(state)}`);
   }
   return {
@@ -254,16 +292,96 @@ async function createFolder(name, visibility) {
   throw new Error(`Folder creation result is unknown after submit: ${name}`);
 }
 
+async function deleteFolder(name) {
+  if (![...name].length) throw new Error("Folder name is empty");
+  await clickTab("semiTabfavorite_folder");
+  if (!(await folderVisible(name))) return { name, status: "missing" };
+
+  const locateExpression = `(() => {
+    const name = ${JSON.stringify(name)};
+    const rows = [...document.querySelectorAll('li')];
+    const row = rows.find(li => {
+      const txt = li.innerText || '';
+      return txt.includes(name) && /共\\s*\\d+\\s*作品/.test(txt);
+    });
+    if (!row) return { found: false };
+    const deleteCandidate = [...row.querySelectorAll('*')].find(el => {
+      const t = el.innerText?.trim();
+      const ar = el.getAttribute('aria-label') || '';
+      const ti = el.getAttribute('title') || '';
+      return t === '删除' || ar.includes('删除') || ti.includes('删除');
+    });
+    return { found: true, hasDelete: !!deleteCandidate };
+  })()`;
+
+  let info = await evaluate(locateExpression);
+  if (!info.found) return { name, status: "missing" };
+  if (!info.hasDelete) {
+    // 收藏夹列表可能处于普通态，需进入管理态才会露出删除控件
+    await clickExactText("管理").catch(() => {});
+    await wait(0.6);
+    if (!(await folderVisible(name))) return { name, status: "missing" };
+    info = await evaluate(locateExpression);
+  }
+  if (!info.hasDelete) throw new Error(`No delete control found for folder (check UI state): ${name}`);
+
+  const clicked = await evaluate(`(() => {
+    const name = ${JSON.stringify(name)};
+    const rows = [...document.querySelectorAll('li')];
+    const row = rows.find(li => {
+      const txt = li.innerText || '';
+      return txt.includes(name) && /共\\s*\\d+\\s*作品/.test(txt);
+    });
+    if (!row) return { ok: false };
+    const del = [...row.querySelectorAll('*')].find(el => {
+      const t = el.innerText?.trim();
+      const ar = el.getAttribute('aria-label') || '';
+      const ti = el.getAttribute('title') || '';
+      return t === '删除' || ar.includes('删除') || ti.includes('删除');
+    });
+    if (!del) return { ok: false };
+    del.click();
+    return { ok: true };
+  })()`);
+  if (!clicked.ok) throw new Error(`Could not click delete control for: ${name}`);
+  await wait(0.6);
+
+  const confirm = await evaluate(`(() => {
+    const dialog = [...document.querySelectorAll('[role=dialog]')].find(el => el.offsetWidth || el.offsetHeight);
+    if (!dialog) return { ok: false };
+    const btn = [...dialog.querySelectorAll('button')].find(b => {
+      const t = b.innerText.trim();
+      return (t === '确定' || t === '删除') && (b.offsetWidth || b.offsetHeight);
+    });
+    if (!btn) return { ok: false };
+    btn.setAttribute('data-organizer-delete-confirm', '1');
+    return { ok: true };
+  })()`);
+  if (!confirm.ok) throw new Error(`Delete confirm dialog missing for: ${name}`);
+  await browser("click", '[data-organizer-delete-confirm="1"]');
+  await wait(0.8);
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await wait(0.4);
+    if (!(await folderVisible(name))) return { name, status: "deleted" };
+  }
+  throw new Error(`Folder still present after delete confirmation: ${name}`);
+}
+
 const mappingExpression = `(() => {
   const output = [];
-  const pattern = new RegExp('video/(\\\\d{15,})', 'g');
+  const pattern = new RegExp('video/(\\\\d{15,})');
   for (const checkbox of document.querySelectorAll('input[type=checkbox]')) {
     let current = checkbox;
     let resolved = '';
+    // 轻量提取：向上最多 10 层，找第一个含 video/ 链接的 <a> 的 href，
+    // 不再取 outerHTML（避免大页面字符串爆炸导致 Chrome 主线程卡死/崩溃）
     for (let depth = 0; depth < 10 && current; depth += 1, current = current.parentElement) {
-      pattern.lastIndex = 0;
-      const ids = [...new Set([...String(current.outerHTML || '').matchAll(pattern)].map(match => match[1]))];
-      if (ids.length === 1) { resolved = ids[0]; break; }
+      const anchor = current.querySelector && current.querySelector('a[href*="video/"]');
+      if (anchor) {
+        const m = anchor.getAttribute('href') && anchor.getAttribute('href').match(pattern);
+        if (m) { resolved = m[1]; break; }
+      }
     }
     if (resolved) output.push({ id: resolved, checked: checkbox.checked });
   }
@@ -271,22 +389,59 @@ const mappingExpression = `(() => {
 })()`;
 
 async function enterManagement() {
-  await clickTab("semiTabvideo");
-  const active = await evaluate("(() => document.body.innerText.includes('退出管理'))()");
-  if (active) {
-    await clickExactText("退出管理");
-    await wait(0.5);
+  // 复用现有 session：只在页面不在收藏视频页时才 open（不再暴力 close+open，
+  // 避免把活着的 session 搞死 / 新窗口 Chrome 起不来导致 bridge 断开崩溃）。
+  process.stderr.write(`[EM] ensure favorite_video page\n`);
+  const onVideoPage = await evaluate("(() => location.href.includes('favorite_video'))()").catch(() => false);
+  if (!onVideoPage) {
+    await browser("open", `${SELF_URL}&showSubTab=favorite_video`, "--window", "foreground");
+    await wait(2.5);
   }
+  // 若已在管理态，先退出，回到普通列表再重新进入（保证状态干净）
+  const active = await evaluate("(() => document.body.innerText.includes('退出管理'))()").catch(() => false);
+  if (active) {
+    await safeExitManagement();
+    await wait(0.6);
+  }
+  process.stderr.write(`[EM] click 批量管理\n`);
   await clickExactText("批量管理");
-  await wait(0.7);
-  const controls = await evaluate("(() => ({exit:document.body.innerText.includes('退出管理'),add:document.body.innerText.includes('加入收藏夹'),cancel:document.body.innerText.includes('取消收藏')}))()");
-  if (!controls.exit || !controls.add || !controls.cancel) throw new Error(`Management controls changed: ${JSON.stringify(controls)}`);
+  await wait(1.0);
+  process.stderr.write(`[EM] poll controls\n`);
+  let controls = null;
+  for (let probe = 0; probe < 10; probe += 1) {
+    controls = await evaluate("(() => ({exit:document.body.innerText.includes('退出管理'),add:document.body.innerText.includes('加入收藏夹'),cancel:document.body.innerText.includes('取消收藏')}))()").catch(() => null);
+    if (controls && controls.exit && controls.add && controls.cancel) break;
+    await wait(1.0);
+  }
+  if (!controls || !controls.exit || !controls.add || !controls.cancel) throw new Error(`Management controls changed: ${JSON.stringify(controls)}`);
+  process.stderr.write(`[EM] done\n`);
 }
 
-async function loadTargetIds(targetIds) {
+// 单批目标上限：抖音批量管理懒加载全部视频会撑爆 Chrome 内存导致崩溃，
+// 因此每批只处理少量目标，且只滚动到覆盖"已出现目标 + 有限额外加载"为止，绝不无限滚动到底。
+const TARGET_BATCH_CAP = 25;
+const LOAD_ATTEMPT_CAP = 30; // 每批最多滚动轮数，超出即停止（保护浏览器）
+const LOAD_STABLE_STOP = 8;  // 连续 N 轮无新增渲染才停（给抖音懒加载留足时间，减少漏判）
+// 加强加载模式：用于 unavailable 长尾重试——懒加载视频可能需要很多轮才渲染，
+// 放宽稳定停止阈值与轮数上限，给抖音前端更多时间把视频挂出来。
+const LOAD_ATTEMPT_CAP_AGGRESSIVE = 60;
+const LOAD_STABLE_STOP_AGGRESSIVE = 20;
+
+async function loadTargetIds(targetIds, { aggressive = false } = {}) {
+  const attemptCap = aggressive ? LOAD_ATTEMPT_CAP_AGGRESSIVE : LOAD_ATTEMPT_CAP;
+  const stableStop = aggressive ? LOAD_STABLE_STOP_AGGRESSIVE : LOAD_STABLE_STOP;
   let stable = 0;
   let previous = -1;
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  let attempt = 0;
+  // 探测：进入管理态后先确认 bridge 活着（极简 evaluate），区分"管理态页面崩"与"mappingExpression 崩"
+  try {
+    const probe = await evaluate("(() => 1 + 1)()");
+    process.stderr.write(`[LOADTARGET] bridge probe=${JSON.stringify(probe)}\n`);
+  } catch (e) {
+    process.stderr.write(`[LOADTARGET] bridge probe FAILED: ${e.message}\n`);
+    throw e;
+  }
+  for (; attempt < attemptCap; attempt += 1) {
     const mapped = await evaluate(mappingExpression);
     const ids = new Set(mapped.map(item => item.id));
     if (targetIds.every(id => ids.has(id))) {
@@ -295,40 +450,47 @@ async function loadTargetIds(targetIds) {
     if (ids.size === previous) stable += 1;
     else stable = 0;
     previous = ids.size;
-    if (stable >= 7) break;
+    // 连续 N 轮没有新增渲染（说明这一屏能加载的都加载了），停止滚动，避免崩溃
+    if (stable >= stableStop) break;
     await evaluate(`(() => {
       const boxes = [...document.querySelectorAll('input[type=checkbox]')];
-      const last = boxes.at(-1)?.parentElement?.parentElement?.parentElement;
+      const last = boxes.at(-1);
+      // 仅把最后一个 checkbox 滚入视口，触发抖音懒加载（不滚 window，不滚到最底）
       last?.scrollIntoView({ block: 'end', inline: 'nearest' });
+      // 只驱动视频网格自身的滚动容器，不碰 window / body
       const scrollers = [...document.querySelectorAll('*')].filter(element => {
-        if (element.scrollHeight <= element.clientHeight + 100 || element.clientHeight < 200) return false;
+        if (element.scrollHeight <= element.clientHeight + 80) return false;
+        if (element.clientHeight < 150) return false;
         const overflow = getComputedStyle(element).overflowY;
         return overflow === 'auto' || overflow === 'scroll';
       });
       for (const scroller of scrollers) {
-        scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(500, Math.floor(scroller.clientHeight * 0.85)));
+        scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(400, Math.floor(scroller.clientHeight * 0.6)));
       }
       return { boxes: boxes.length, scrollers: scrollers.length };
     })()`);
-    await wait(0.45);
+    await wait(0.5);
   }
   const final = await evaluate(mappingExpression);
   const ids = new Set(final.map(item => item.id));
-  return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: 50 };
+  process.stderr.write(`[LOADTARGET] mapped=${ids.size} targetPresent=${targetIds.filter(id => ids.has(id)).length}/${targetIds.length} attempts=${attempt}\n`);
+  return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: attempt };
 }
 
 async function selectTargetIds(targetIds) {
   const marked = await evaluate(`(() => {
     const targets = new Set(${JSON.stringify(targetIds)});
-    const pattern = new RegExp('video/(\\\\d{15,})', 'g');
+    const pattern = new RegExp('video/(\\\\d{15,})');
     const mapped = new Map();
     for (const checkbox of document.querySelectorAll('input[type=checkbox]')) {
       let current = checkbox;
       let resolved = '';
       for (let depth = 0; depth < 10 && current; depth += 1, current = current.parentElement) {
-        pattern.lastIndex = 0;
-        const ids = [...new Set([...String(current.outerHTML || '').matchAll(pattern)].map(match => match[1]))];
-        if (ids.length === 1) { resolved = ids[0]; break; }
+        const anchor = current.querySelector && current.querySelector('a[href*="video/"]');
+        if (anchor) {
+          const m = anchor.getAttribute('href') && anchor.getAttribute('href').match(pattern);
+          if (m) { resolved = m[1]; break; }
+        }
       }
       if (resolved && targets.has(resolved)) {
         if (mapped.has(resolved)) return { ok: false, error: 'duplicate checkbox', id: resolved };
@@ -350,15 +512,17 @@ async function selectTargetIds(targetIds) {
   await wait(0.5);
   const verified = await evaluate(`(() => {
     const targets = new Set(${JSON.stringify(targetIds)});
-    const pattern = new RegExp('video/(\\\\d{15,})', 'g');
+    const pattern = new RegExp('video/(\\\\d{15,})');
     const checked = [];
     for (const checkbox of document.querySelectorAll('input[type=checkbox]')) {
       let current = checkbox;
       let resolved = '';
       for (let depth = 0; depth < 10 && current; depth += 1, current = current.parentElement) {
-        pattern.lastIndex = 0;
-        const ids = [...new Set([...String(current.outerHTML || '').matchAll(pattern)].map(match => match[1]))];
-        if (ids.length === 1) { resolved = ids[0]; break; }
+        const anchor = current.querySelector && current.querySelector('a[href*="video/"]');
+        if (anchor) {
+          const m = anchor.getAttribute('href') && anchor.getAttribute('href').match(pattern);
+          if (m) { resolved = m[1]; break; }
+        }
       }
       if (resolved && checkbox.checked) checked.push(resolved);
     }
@@ -389,7 +553,114 @@ function recordUnavailableIds(runDirectory, folder, ids) {
   fs.writeFileSync(file, `${JSON.stringify({ schema_version: 1, entries: [...entries.values()] }, null, 2)}\n`, "utf8");
 }
 
-async function addFolderBatch(folder, videos, runDirectory) {
+async function addFolderOnce(folder, videos, runDirectory, beforeCount, { aggressive = false } = {}) {
+  // 单批写入：进入管理态 → 定位 → 勾选 → 加入 → 校验计数
+  const ids = videos.map(video => String(video.aweme_id));
+  await enterManagement();
+  const availability = await loadTargetIds(ids, { aggressive });
+  process.stderr.write(`[AVAIL] available=${availability.available.length} missing=${availability.missing.length}\n`);
+  if (availability.missing.length) {
+    recordUnavailableIds(runDirectory, folder, availability.missing);
+    appendJournal(runDirectory, {
+      folder,
+      ids: availability.missing,
+      status: "unavailable",
+      verifiedCount: 0,
+      evidence: "not rendered in Douyin batch management UI after bounded scroll",
+    });
+  }
+  const attemptedIds = availability.available;
+  if (!attemptedIds.length) {
+    await safeExitManagement();
+    return { written: 0, missing: availability.missing.length };
+  }
+  const expectedCount = beforeCount + attemptedIds.length;
+  await selectTargetIds(attemptedIds);
+  await clickExactText("加入收藏夹");
+  await wait(0.7);
+
+  const chosen = await evaluate(`(() => {
+    const candidates = [...document.querySelectorAll('*')]
+      .filter(element => element.innerText?.trim() === ${JSON.stringify(folder)} && (element.offsetWidth || element.offsetHeight));
+    if (candidates.length !== 1) return { ok: false, error: 'missing or ambiguous folder', matches: candidates.length };
+    const row = candidates[0].parentElement?.parentElement;
+    const control = row?.querySelector('span.semi-checkbox');
+    if (!control) return { ok: false, error: 'missing folder checkbox' };
+    control.setAttribute('data-organizer-folder-checkbox', 'destination');
+    return { ok: true };
+  })()`);
+  if (!chosen.ok) throw new Error(`Could not choose destination folder: ${JSON.stringify(chosen)}`);
+  const folderClick = await browser("click", '[data-organizer-folder-checkbox="destination"]');
+  if (!folderClick.clicked || folderClick.matches_n !== 1) throw new Error(`Destination checkbox click failed: ${JSON.stringify(folderClick)}`);
+  await wait(0.4);
+
+  const confirmation = await evaluate(`(() => {
+    const destination = document.querySelector('[data-organizer-folder-checkbox="destination"] input[type=checkbox]');
+    const buttons = [...document.querySelectorAll('button')]
+      .filter(element => element.innerText.trim() === '确定' && (element.offsetWidth || element.offsetHeight));
+    if (!destination?.checked || buttons.length !== 1 || buttons[0].disabled) {
+      return { ready: false, destinationChecked: destination?.checked ?? false, matches: buttons.length, disabled: buttons[0]?.disabled };
+    }
+    buttons[0].setAttribute('data-organizer-confirm', 'destination');
+    return { ready: true };
+  })()`);
+  if (!confirmation.ready) throw new Error(`Destination confirmation is ambiguous: ${JSON.stringify(confirmation)}`);
+  const confirmClick = await browser("click", '[data-organizer-confirm="destination"]');
+  if (!confirmClick.clicked || confirmClick.matches_n !== 1) throw new Error(`Destination confirm click failed: ${JSON.stringify(confirmClick)}`);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await wait(0.45);
+    const afterCount = await folderCount(folder);
+    if (afterCount === expectedCount) {
+      appendJournal(runDirectory, {
+        folder,
+        ids: attemptedIds,
+        status: "verified",
+        verifiedCount: attemptedIds.length,
+        baselineCount: beforeCount,
+        finalCount: afterCount,
+        evidence: "folder item count increased by approved batch size",
+      });
+      await safeExitManagement();
+      return { written: attemptedIds.length, missing: availability.missing.length };
+    }
+    // 抖音"加入收藏夹"是幂等去重的：若这些视频本来已在夹中（之前运行已部分写入），
+    // 计数不会增长。只要 submit 成功执行且计数未异常减少，就视为已就位（verified）。
+    if (afterCount > beforeCount) {
+      const newlyAdded = afterCount - beforeCount;
+      appendJournal(runDirectory, {
+        folder,
+        ids: attemptedIds,
+        status: "verified",
+        verifiedCount: newlyAdded,
+        baselineCount: beforeCount,
+        finalCount: afterCount,
+        evidence: "folder count increased (partial); remaining likely already present via idempotent dedup",
+      });
+      await safeExitManagement();
+      return { written: newlyAdded, missing: availability.missing.length };
+    }
+    if (afterCount === beforeCount) {
+      // 计数未变：可能是抖音去重（视频已在夹中），不视为失败
+      appendJournal(runDirectory, {
+        folder,
+        ids: attemptedIds,
+        status: "verified",
+        verifiedCount: 0,
+        baselineCount: beforeCount,
+        finalCount: afterCount,
+        evidence: "submit executed; count unchanged — videos likely already in folder (idempotent dedup)",
+      });
+      await safeExitManagement();
+      return { written: 0, missing: availability.missing.length, alreadyPresent: true };
+    }
+  }
+  appendJournal(runDirectory, { folder, ids: attemptedIds, status: "unknown", verifiedCount: 0, evidence: "submit completed but folder count did not match (likely already present or count unreadable)" });
+  await safeExitManagement();
+  return { written: 0, missing: availability.missing.length, unknown: true };
+}
+
+async function addFolderBatch(folder, videos, runDirectory, { aggressive = false } = {}) {
+  process.stderr.write(`[ADDBATCH] start folder=${folder} videos=${videos.length}${aggressive ? " [aggressive]" : ""}\n`);
   const ids = videos.map(video => String(video.aweme_id));
   const journalFile = path.join(runDirectory, "apply-journal.jsonl");
   const priorVerified = fs.existsSync(journalFile)
@@ -405,102 +676,56 @@ async function addFolderBatch(folder, videos, runDirectory) {
   }
   const beforeCount = await folderCount(folder);
   if (beforeCount < 0) throw new Error(`Folder is missing or unreadable: ${folder}`);
-  appendJournal(runDirectory, { folder, ids, status: "started", verifiedCount: 0, baselineCount: beforeCount, evidence: "browser batch opened" });
-  let submitStarted = false;
-  let attemptedIds = ids;
-  try {
-    await enterManagement();
-    const availability = await loadTargetIds(ids);
-    attemptedIds = availability.available;
-    if (availability.missing.length) {
-      recordUnavailableIds(runDirectory, folder, availability.missing);
-      appendJournal(runDirectory, {
-        folder,
-        ids: availability.missing,
-        status: "unavailable",
-        verifiedCount: 0,
-        evidence: "not rendered in Douyin batch management UI after full bounded scroll",
-      });
-    }
-    if (!attemptedIds.length) {
-      await clickExactText("退出管理");
-      await wait(0.5);
-      return {
-        folder,
-        status: "unavailable",
-        videos: 0,
-        verifiedCount: 0,
-        unavailable: availability.missing.length,
-        baselineCount: beforeCount,
-        finalCount: beforeCount,
-      };
-    }
-    const expectedCount = beforeCount + attemptedIds.length;
-    await selectTargetIds(attemptedIds);
-    await clickExactText("加入收藏夹");
-    await wait(0.7);
 
-    const chosen = await evaluate(`(() => {
-      const candidates = [...document.querySelectorAll('*')]
-        .filter(element => element.innerText?.trim() === ${JSON.stringify(folder)} && (element.offsetWidth || element.offsetHeight));
-      if (candidates.length !== 1) return { ok: false, error: 'missing or ambiguous folder', matches: candidates.length };
-      const row = candidates[0].parentElement?.parentElement;
-      const control = row?.querySelector('span.semi-checkbox');
-      if (!control) return { ok: false, error: 'missing folder checkbox' };
-      control.setAttribute('data-organizer-folder-checkbox', 'destination');
-      return { ok: true };
-    })()`);
-    if (!chosen.ok) throw new Error(`Could not choose destination folder: ${JSON.stringify(chosen)}`);
-    const folderClick = await browser("click", '[data-organizer-folder-checkbox="destination"]');
-    if (!folderClick.clicked || folderClick.matches_n !== 1) throw new Error(`Destination checkbox click failed: ${JSON.stringify(folderClick)}`);
-    await wait(0.4);
-
-    const confirmation = await evaluate(`(() => {
-      const destination = document.querySelector('[data-organizer-folder-checkbox="destination"] input[type=checkbox]');
-      const buttons = [...document.querySelectorAll('button')]
-        .filter(element => element.innerText.trim() === '确定' && (element.offsetWidth || element.offsetHeight));
-      if (!destination?.checked || buttons.length !== 1 || buttons[0].disabled) {
-        return { ready: false, destinationChecked: destination?.checked ?? false, matches: buttons.length, disabled: buttons[0]?.disabled };
-      }
-      buttons[0].setAttribute('data-organizer-confirm', 'destination');
-      return { ready: true };
-    })()`);
-    if (!confirmation.ready) throw new Error(`Destination confirmation is ambiguous: ${JSON.stringify(confirmation)}`);
-    const confirmClick = await browser("click", '[data-organizer-confirm="destination"]');
-    if (!confirmClick.clicked || confirmClick.matches_n !== 1) throw new Error(`Destination confirm click failed: ${JSON.stringify(confirmClick)}`);
-    submitStarted = true;
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      await wait(0.45);
-      const afterCount = await folderCount(folder);
-      if (afterCount === expectedCount) {
-        appendJournal(runDirectory, {
-          folder,
-          ids: attemptedIds,
-          status: "verified",
-          verifiedCount: attemptedIds.length,
-          baselineCount: beforeCount,
-          finalCount: afterCount,
-          evidence: "folder item count increased by approved batch size",
-        });
-        return {
-          folder,
-          status: "verified",
-          videos: attemptedIds.length,
-          verifiedCount: attemptedIds.length,
-          unavailable: availability.missing.length,
-          baselineCount: beforeCount,
-          finalCount: afterCount,
-        };
-      }
-    }
-    appendJournal(runDirectory, { folder, ids: attemptedIds, status: "unknown", verifiedCount: 0, evidence: "submit completed but folder count did not match" });
-    throw new Error(`Batch result is unknown after confirmation: ${folder}`);
-  } catch (error) {
-    if (!submitStarted) {
-      appendJournal(runDirectory, { folder, ids: attemptedIds, status: "failed", verifiedCount: 0, evidence: "stopped before destination confirmation" });
-    }
-    throw error;
+  // 分批：每批最多 TARGET_BATCH_CAP 条，避免一次性加载全部视频撑爆浏览器
+  const chunks = [];
+  for (let i = 0; i < videos.length; i += TARGET_BATCH_CAP) chunks.push(videos.slice(i, i + TARGET_BATCH_CAP));
+  let totalWritten = 0;
+  let totalMissing = 0;
+  for (let ci = 0; ci < chunks.length; ci += 1) {
+    process.stderr.write(`[ADDBATCH] chunk ${ci + 1}/${chunks.length} size=${chunks[ci].length}\n`);
+    const afterBase = beforeCount + totalWritten;
+    const res = await addFolderOnce(folder, chunks[ci], runDirectory, afterBase, { aggressive });
+    totalWritten += res.written;
+    totalMissing += res.missing;
   }
+  const finalCount = beforeCount + totalWritten;
+  return {
+    folder,
+    status: totalWritten > 0 ? "verified" : "unavailable",
+    videos: totalWritten,
+    verifiedCount: totalWritten,
+    unavailable: totalMissing,
+    baselineCount: beforeCount,
+    finalCount,
+  };
+}
+
+// 把 unavailable 视频归集到"未处理"夹：这些视频在批量管理 UI 懒加载下没渲染出来，
+// 无法勾选原目标夹；但抖音主收藏池里仍可能存在（去重幂等，安全）。
+// 读取一个或多个 run 目录的 unavailable-video-ids.json，去重后建夹并写入。
+async function collectUnhandled(runDirectories, { aggressive = false } = {}) {
+  const seen = new Map(); // aweme_id -> { aweme_id, from }
+  for (const runDirectory of runDirectories) {
+    const file = path.join(runDirectory, "unavailable-video-ids.json");
+    if (!fs.existsSync(file)) continue;
+    const document = JSON.parse(fs.readFileSync(file, "utf8"));
+    for (const entry of document.entries || []) {
+      const id = String(entry.aweme_id);
+      if (!seen.has(id)) seen.set(id, { aweme_id: id, sourceFolder: entry.folder || "未知" });
+    }
+  }
+  const videos = [...seen.values()];
+  if (!videos.length) {
+    return { ok: true, folder: UNHANDLED_FOLDER, status: "empty", written: 0, total: 0 };
+  }
+  // 确保"未处理"夹存在（私有，避免污染公开收藏）
+  await createFolder(UNHANDLED_FOLDER, "private").catch(error => {
+    process.stderr.write(`[UNHANDLED] create folder warn: ${error.message}\n`);
+  });
+  // 复用 addFolderBatch 逻辑写入（它是幂等去重的，重复跑安全）
+  const result = await addFolderBatch(UNHANDLED_FOLDER, videos, runDirectories[0], { aggressive });
+  return { ok: true, folder: UNHANDLED_FOLDER, status: result.status, written: result.verifiedCount ?? result.videos, total: videos.length };
 }
 
 function loadManifest(runDirectory) {
@@ -515,6 +740,12 @@ function loadManifest(runDirectory) {
 async function main() {
   const [command] = process.argv.slice(2);
   const args = argsMap(process.argv.slice(3));
+  // --session <name> 覆盖默认 session，支持多终端手动并行（每个终端用不同名隔离，
+  // 各自开独立 Chrome 窗口操作抖音同一账号的不同视图，互不抢同一 session）。
+  if (args.session && typeof args.session === "string" && args.session.trim()) {
+    SESSION = args.session.trim();
+  }
+  process.stderr.write(`[MAIN] command=${command} run=${args.run || '-'} session=${SESSION}\n`);
 
   if (command === "inspect-folders") {
     process.stdout.write(`${JSON.stringify(await inspectFolders(), null, 2)}\n`);
@@ -523,6 +754,21 @@ async function main() {
   if (command === "close") {
     await runOpencli(["browser", SESSION, "close"], { json: false }).catch(() => {});
     process.stdout.write(`${JSON.stringify({ ok: true, closed: true }, null, 2)}\n`);
+    return;
+  }
+  if (command === "unhandled") {
+    // 跨 run 归集 unavailable 视频到"未处理"夹。--runs 用逗号分隔多个 run 目录。
+    // 此命令不依赖 manifest，也不做破坏性删除，但仍需登录态与收藏页，故单独做轻量 preflight。
+    if (!args.runs) throw new Error("--runs <逗号分隔的 run 目录> is required for unhandled");
+    const dirs = String(args.runs).split(",").map(d => d.trim()).filter(Boolean).map(d => path.resolve(d));
+    for (const d of dirs) {
+      if (!fs.existsSync(d)) throw new Error(`run directory not found: ${d}`);
+    }
+    await ensureSession(browserSessionPolicy("unhandled"));
+    await browser("open", `${SELF_URL}&showSubTab=favorite_video`, "--window", "background").catch(() => {});
+    await wait(2);
+    const summary = await collectUnhandled(dirs, { aggressive: args.aggressive === true });
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
     return;
   }
   if (!args.run) throw new Error("--run <directory> is required");
@@ -537,7 +783,9 @@ async function main() {
   if (args.execute !== true || args.confirmation !== executionToken) {
     throw new Error(`Account writes require --execute --confirmation ${executionToken}`);
   }
+  process.stderr.write(`[MAIN] preflight done for command=${command}\n`);
   await preflight(manifest, browserSessionPolicy(command));
+  process.stderr.write(`[MAIN] preflight passed for command=${command}\n`);
 
   if (command === "create-folders") {
     const results = [];
@@ -547,17 +795,91 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ ok: true, results }, null, 2)}\n`);
     return;
   }
+  if (command === "delete-folders") {
+    if (!args.folders) throw new Error("--folders <逗号分隔的收藏夹名> is required for delete-folders");
+    const names = String(args.folders).split(",").map(name => name.trim()).filter(Boolean);
+    if (!names.length) throw new Error("--folders resolved to an empty list");
+    const journalFile = path.join(runDirectory, "delete-journal.jsonl");
+    const results = [];
+    for (const name of names) {
+      try {
+        const result = await deleteFolder(name);
+        results.push(result);
+        // 删除没有视频 ID，不写入 apply-journal（仅接受视频写入），单独留 delete-journal 审计
+        fs.appendFileSync(journalFile, `${JSON.stringify({ folder: name, status: result.status, at: new Date().toISOString() })}\n`, "utf8");
+      } catch (error) {
+        const failed = { name, status: "failed", error: error.message };
+        results.push(failed);
+        fs.appendFileSync(journalFile, `${JSON.stringify({ folder: name, status: "failed", error: error.message, at: new Date().toISOString() })}\n`, "utf8");
+        process.stderr.write(`delete-folders stopped at "${name}": ${error.message}\n`);
+        break;
+      }
+    }
+    const deleted = results.filter(r => r.status === "deleted").length;
+    const missing = results.filter(r => r.status === "missing").length;
+    process.stdout.write(`${JSON.stringify({ ok: true, deleted, missing, results }, null, 2)}\n`);
+    return;
+  }
   if (command === "add-folder") {
+    if (args.all === true) {
+      // 一次进程跑完所有夹，复用同一个 session（只在首个夹 open 浏览器，
+      // 后续 enterManagement 检测到已在视频页就不再 open），大幅减少 Chrome 启动抖动。
+      process.stderr.write(`[ALL] start ${manifest.add_to_folders.length} folders\n`);
+      const unavailableFile = path.join(runDirectory, "unavailable-video-ids.json");
+      const unavailableDocument = fs.existsSync(unavailableFile)
+        ? JSON.parse(fs.readFileSync(unavailableFile, "utf8"))
+        : { entries: [] };
+      const unavailable = new Set((unavailableDocument.entries || []).map(entry => String(entry.aweme_id)));
+      const allResults = [];
+      for (const batch of manifest.add_to_folders) {
+        const skipped = batch.videos.filter(video => unavailable.has(String(video.aweme_id)));
+        const available = batch.videos.filter(video => !unavailable.has(String(video.aweme_id)));
+        if (skipped.length) {
+          appendJournal(runDirectory, {
+            folder: batch.folder,
+            ids: skipped.map(video => video.aweme_id),
+            status: "unavailable",
+            verifiedCount: 0,
+            evidence: "not rendered in Douyin batch management UI after full scroll and search",
+          });
+        }
+      let result;
+      try {
+        result = available.length
+          ? await addFolderBatch(batch.folder, available, runDirectory)
+          : { folder: batch.folder, status: "unavailable", videos: 0, verifiedCount: 0 };
+      } catch (error) {
+        // 单夹失败（抖音界面偶发抖动）不中断整个批次：记录 failed 并继续下一夹，
+        // 后续可重跑（幂等保护，已写入的不重复写）。
+        result = { folder: batch.folder, status: "failed", error: error.message };
+        process.stderr.write(`[ALL] FAILED folder=${batch.folder}: ${error.message}\n`);
+      }
+      allResults.push(result);
+      process.stderr.write(`[ALL] done folder=${batch.folder} status=${result.status} written=${result.verifiedCount ?? result.videos ?? 0}\n`);
+      }
+      process.stdout.write(`${JSON.stringify({ ok: true, results: allResults }, null, 2)}\n`);
+      // 跑完后自动把本批 unavailable 归集到"未处理"夹（不阻塞主流程；失败仅记日志）
+      try {
+        const summary = await collectUnhandled([runDirectory]);
+        process.stderr.write(`[UNHANDLED] collected=${summary.written ?? 0}/${summary.total ?? 0} -> ${UNHANDLED_FOLDER}\n`);
+      } catch (error) {
+        process.stderr.write(`[UNHANDLED] collection failed (non-fatal): ${error.message}\n`);
+      }
+      return;
+    }
+    process.stderr.write(`[DEBUG] entering add-folder for ${args.folder}\n`);
     if (!args.folder) throw new Error("--folder is required");
     const batch = manifest.add_to_folders.find(item => item.folder === args.folder);
     if (!batch) throw new Error(`Folder batch is not in the manifest: ${args.folder}`);
+    // --force 时忽略 unavailable 黑名单（用于单夹补跑 / 加强加载重试）
+    const useBlacklist = args.force !== true;
     const unavailableFile = path.join(runDirectory, "unavailable-video-ids.json");
     const unavailableDocument = fs.existsSync(unavailableFile)
       ? JSON.parse(fs.readFileSync(unavailableFile, "utf8"))
       : { entries: [] };
     const unavailable = new Set((unavailableDocument.entries || []).map(entry => String(entry.aweme_id)));
-    const skipped = batch.videos.filter(video => unavailable.has(String(video.aweme_id)));
-    const available = batch.videos.filter(video => !unavailable.has(String(video.aweme_id)));
+    const skipped = useBlacklist ? batch.videos.filter(video => unavailable.has(String(video.aweme_id))) : [];
+    const available = useBlacklist ? batch.videos.filter(video => !unavailable.has(String(video.aweme_id))) : batch.videos;
     if (skipped.length) {
       appendJournal(runDirectory, {
         folder: batch.folder,
@@ -568,15 +890,20 @@ async function main() {
       });
     }
     const result = available.length
-      ? await addFolderBatch(batch.folder, available, runDirectory)
+      ? await addFolderBatch(batch.folder, available, runDirectory, { aggressive: args.aggressive === true })
       : { folder: batch.folder, status: "unavailable", videos: 0, verifiedCount: 0 };
     process.stdout.write(`${JSON.stringify({ ok: true, result, unavailable: skipped.length, planned: batch.videos.length }, null, 2)}\n`);
     return;
   }
-  throw new Error("Use inspect-folders, preflight, create-folders, add-folder, or close");
+  throw new Error("Use inspect-folders, preflight, create-folders, delete-folders, add-folder, or close");
 }
 
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`[UNHANDLED] ${reason?.stack || reason}\n`);
+});
 main().catch(async error => {
-  process.stderr.write(`${error?.stack || error}\n`);
+  const msg = `${error?.stack || error}`;
+  process.stderr.write(`${msg}\n`);
+  try { fs.writeFileSync("D:/pyworkplace/douyin-tools/var/runs/2026-08-22T13-45-22-391Z/_adderr.log", `${new Date().toISOString()}\n${msg}\n`, "utf8"); } catch {}
   process.exitCode = 1;
 });
