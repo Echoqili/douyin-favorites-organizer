@@ -383,3 +383,8 @@ async function main() {
   log(`状态文件: ${STATE_FILE}`);
   if (err > 0) log(`提示: 失败片可重跑本脚本（自动续跑 done，重试 error）或 --only 指定片号`);
 }
+
+main().catch(err => {
+  process.stderr.write(`${err?.stack || err}\n`);
+  process.exitCode = 1;
+});
