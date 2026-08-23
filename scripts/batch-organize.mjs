@@ -34,9 +34,10 @@ const FULL_DIR = path.join(RUNS_DIR, "_full");
 const STATE_FILE = path.join(RUNS_DIR, "_batch_state.json");
 
 const SLICE_SIZE = Number(process.argv.includes("--size") ? process.argv[process.argv.indexOf("--size") + 1] : 150);
-const LIMIT = Number(process.argv.includes("--limit") ? process.argv[process.argv.indexOf("--limit") + 1] : 5500);
+// 默认 limit=1000：覆盖全量收藏，又不至于像 3000 那样渲染超时（实测 500 已足够覆盖 295 条）
+const LIMIT = Number(process.argv.includes("--limit") ? process.argv[process.argv.indexOf("--limit") + 1] : 1000);
 const DO_COLLECT = !process.argv.includes("--no-collect");
-const COLLECT_PER_SLICE = process.argv.includes("--collect-per-slice") || !process.argv.includes("--no-collect");
+const COLLECT_PER_SLICE = process.argv.includes("--collect-per-slice");
 const COLLECT_INTERVAL = Number(process.argv.includes("--collect-interval") ? process.argv[process.argv.indexOf("--collect-interval") + 1] : 8000); // ms 片间避让
 const APPLY_RETRIES = 3;
 const APPLY_RETRY_WAIT = 15_000; // ms
@@ -60,7 +61,11 @@ function saveState(state) {
 
 function runOpencli(args, { json = true, logFile = null } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, { cwd: PROJECT_ROOT, windowsHide: true, shell: false });
+    // OPENCLI_BROWSER_COMMAND_TIMEOUT: 抖音收藏列表渲染慢，默认 60s 会超时；统一放宽到 300s
+    const child = spawn(process.execPath, args, {
+      cwd: PROJECT_ROOT, windowsHide: true, shell: false,
+      env: { ...process.env, OPENCLI_BROWSER_COMMAND_TIMEOUT: "300" },
+    });
     let stdout = "", stderr = "";
     const logStream = logFile ? fs.createWriteStream(logFile, { flags: "a" }) : null;
     child.stdout.setEncoding("utf8");
@@ -319,18 +324,37 @@ async function processSlice(index, slice, state) {
   saveState(state);
 }
 
+/**
+ * 并发写入（--parallel N）：同时跑 N 片，每片独立 --session 隔离。
+ * 加速明显，但抖音同账号多窗口并行有风控风险，建议 2-3 并发上限。
+ */
+async function runParallel(slices, state, n) {
+  const pending = slices.map((slice, i) => ({ i, slice }));
+  const workers = Array.from({ length: n }, async () => {
+    while (pending.length > 0) {
+      const { i, slice } = pending.shift();
+      await processSlice(i, slice, state);
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function main() {
   ensureDirectory(RUNS_DIR);
   const state = loadState();
   const COLLECT_ONLY = process.argv.includes("--collect-only");
+  const PARALLEL = process.argv.includes("--parallel")
+    ? Number(process.argv[process.argv.indexOf("--parallel") + 1]) : 1;
 
   let slices;
-  if (DO_COLLECT && COLLECT_PER_SLICE) {
-    const all = await collectPerSlice();
-    slices = sliceFavorites(all);
-  } else if (DO_COLLECT) {
+  if (DO_COLLECT && !COLLECT_PER_SLICE) {
+    // 默认：大 limit 一次拉回（实测 limit=500 返回全部 295 条 coverage_warning=false）。
+    // 深分页(offset≥1050)已被证实会卡死/超时，仅当 --collect-per-slice 显式启用时才走逐页采集。
     await collectFull();
     slices = sliceFavorites();
+  } else if (DO_COLLECT) {
+    const all = await collectPerSlice();
+    slices = sliceFavorites(all);
   } else {
     slices = sliceFavorites();
   }
@@ -341,8 +365,13 @@ async function main() {
     return;
   }
 
-  for (let i = 0; i < slices.length; i++) {
-    await processSlice(i, slices[i], state);
+  if (PARALLEL > 1) {
+    log(`并发模式: ${PARALLEL} 片同时写（每片独立 session）。注意抖音风控，建议 ≤3。`);
+    await runParallel(slices, state, PARALLEL);
+  } else {
+    for (let i = 0; i < slices.length; i++) {
+      await processSlice(i, slices[i], state);
+    }
   }
 
   // 汇总
@@ -354,8 +383,3 @@ async function main() {
   log(`状态文件: ${STATE_FILE}`);
   if (err > 0) log(`提示: 失败片可重跑本脚本（自动续跑 done，重试 error）或 --only 指定片号`);
 }
-
-main().catch(err => {
-  process.stderr.write(`${err?.stack || err}\n`);
-  process.exitCode = 1;
-});
