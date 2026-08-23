@@ -1,5 +1,5 @@
-const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 200;
+﻿const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 12000;
 const PAGE_SIZE = 18;
 const SAVED_VIDEO_ENDPOINTS = [
   "/aweme/v1/web/aweme/listcollection/",

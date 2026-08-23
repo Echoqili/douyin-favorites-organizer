@@ -1,4 +1,4 @@
-import path from "node:path";
+﻿import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
@@ -45,11 +45,12 @@ export function sanitizeFavorite(row, rank) {
   };
 }
 
-export async function collectFavorites({ limit = 200, outputDirectory } = {}) {
+export async function collectFavorites({ limit = 200, offset = 0, outputDirectory } = {}) {
   const normalizedLimit = Number(limit);
-  if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 200) {
-    throw new Error("limit must be an integer between 1 and 200");
+  if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 12000) {
+    throw new Error("limit must be an integer between 1 and 12000");
   }
+  const normalizedOffset = Math.max(0, Number(offset) || 0);
   if (!fs.existsSync(LOCAL_OPENCLI)) {
     throw new Error("Project-local OpenCLI is missing. Run npm install first.");
   }
@@ -65,6 +66,8 @@ export async function collectFavorites({ limit = 200, outputDirectory } = {}) {
     "saved",
     "--limit",
     String(normalizedLimit),
+    "--offset",
+    String(normalizedOffset),
     "-f",
     "json",
   ]);
@@ -84,6 +87,7 @@ export async function collectFavorites({ limit = 200, outputDirectory } = {}) {
     captured_at: new Date().toISOString(),
     source: "opencli douyin saved",
     requested_limit: normalizedLimit,
+    requested_offset: normalizedOffset,
     count: favorites.length,
     coverage_warning: favorites.length === normalizedLimit,
     source_sha256: sourceHash,

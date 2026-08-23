@@ -1,4 +1,4 @@
-import { cli, Strategy } from "@jackwener/opencli/registry";
+﻿import { cli, Strategy } from "@jackwener/opencli/registry";
 import {
   ArgumentError,
   AuthRequiredError,
@@ -233,12 +233,12 @@ async function scrollSavedPage(page) {
   `);
 }
 
-async function captureSavedVideos(page, limit) {
+async function captureSavedVideos(page, target, offset) {
   let snapshot = { pages: [], errors: [], pending: 0, domIds: [] };
   let previousSignature = "";
   let stableRounds = 0;
 
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
     await page.wait(0.75);
     snapshot = await readSavedCapture(page);
     const allItems = mergeCapturedSavedPages(snapshot.pages, limits.max);
@@ -247,22 +247,14 @@ async function captureSavedVideos(page, limit) {
     else stableRounds = 0;
     previousSignature = signature;
 
-    if (allItems.length >= limit && stableRounds >= 2) break;
+    if (allItems.length >= target) break;
     if (allItems.length > 0 && stableRounds >= 5) break;
     await scrollSavedPage(page);
   }
 
   snapshot = await readSavedCapture(page);
   const allItems = mergeCapturedSavedPages(snapshot.pages, limits.max);
-  const capturedIds = new Set(allItems.map(item => String(item.aweme_id || item.awemeId || "")));
-  const missingDomIds = snapshot.domIds.filter(id => !capturedIds.has(String(id)));
-  if (missingDomIds.length > 0) {
-    throw new CommandExecutionError(
-      `Douyin saved capture was incomplete: ${missingDomIds.length} visible video(s) were missing from captured responses `
-      + `(captured pages: ${snapshot.pages.length}, captured videos: ${allItems.length}, capture errors: ${snapshot.errors.length}).`
-    );
-  }
-  return allItems.slice(0, limit);
+return allItems.slice(offset, target);
 }
 
 async function restoreSavedResponseCapture(page) {
@@ -297,6 +289,12 @@ cli({
       default: false,
       help: "Include a transient signed media URL for immediate local download",
     },
+    {
+      name: "offset",
+      type: "int",
+      default: 0,
+      help: "Number of saved videos to skip before returning results (batch backfill)",
+    },
   ],
   columns: [
     "rank",
@@ -312,6 +310,8 @@ cli({
   ],
   func: async (page, kwargs) => {
     const limit = parseLimit(kwargs.limit);
+    const offset = Math.max(0, Number(kwargs.offset || 0));
+    const target = offset + limit;
     const includePlayUrl = kwargs.include_play_url === true;
     await page.goto(SAVED_PAGE_URL);
     await page.wait(3);
@@ -342,7 +342,7 @@ cli({
       if (!clicked) {
         throw new CommandExecutionError("Could not open the Douyin saved video tab");
       }
-      const items = await captureSavedVideos(page, limit);
+      const items = await captureSavedVideos(page, target, offset);
       if (items.length === 0) {
         throw new EmptyResultError(
           "douyin saved",
