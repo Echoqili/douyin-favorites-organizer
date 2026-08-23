@@ -244,6 +244,12 @@ async function processSlice(index, slice, state) {
     }
   }
 
+  // 4.5 释放该 session 的浏览器窗口，降低 Chrome 内存占用（每片结束必执行）
+  try {
+    await runOpencli(["browser", `batch-${index + 1}`, "close"], { json: false }).catch(() => {});
+    log(`  已关闭 session=batch-${index + 1} 浏览器窗口（释放内存）`);
+  } catch { /* ignore */ }
+
   if (applied) {
     state.slices[dirName] = { status: "done", count: slice.length, assignments, at: new Date().toISOString() };
     log(`  ✓ #${index + 1} 完成`);
@@ -257,6 +263,7 @@ async function processSlice(index, slice, state) {
 async function main() {
   ensureDirectory(RUNS_DIR);
   const state = loadState();
+  const COLLECT_ONLY = process.argv.includes("--collect-only");
 
   let slices;
   if (DO_COLLECT && COLLECT_PER_SLICE) {
@@ -269,6 +276,11 @@ async function main() {
     slices = sliceFavorites();
   }
   log(`共 ${slices.length} 片待处理`);
+
+  if (COLLECT_ONLY) {
+    log(`--collect-only 模式：仅采集，已写出 var/runs/_full/favorites.json（count=${slices.length}），不写入抖音。手动全量写入请重跑不带此参数。`);
+    return;
+  }
 
   for (let i = 0; i < slices.length; i++) {
     await processSlice(i, slices[i], state);
