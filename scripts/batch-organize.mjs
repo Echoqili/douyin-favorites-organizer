@@ -89,47 +89,106 @@ async function collectFull() {
 }
 
 /**
- * 限频安全模式：逐片采集。每片 collect 一小批（SLICE_SIZE 条，offset=i*SLICE_SIZE），
+ * 限频安全 + 断点续采模式：逐页采集（每页 SLICE_SIZE 条，offset 递增），
  * 片间 sleep COLLECT_INTERVAL 避让抖音频率风控。返回 slice 数组。
+ *
+ * 鲁棒性：
+ *  - 超时/失败重试同一 offset（最多 COLLECT_RETRIES 次），不盲目跳过以免丢数据；
+ *  - 连续 EMPTY_STOP 次返回 0 条才算到达收藏末尾；
+ *  - 支持断点续采：扫描已有 _collect_* 目录，从最大 offset 之后继续，不重复；
+ *  - 支持 --max-pages N：单次最多采 N 页就停（落盘当前累计），下次接着跑。
  */
-async function collectPerSlice() {
+const COLLECT_RETRIES = 3;
+const EMPTY_STOP = 3;
+
+function findExistingCollectOffsets() {
+  const offsets = new Set();
+  try {
+    for (const name of fs.readdirSync(RUNS_DIR)) {
+      const m = name.match(/^_collect_(\d+)$/);
+      if (m) {
+        const dir = path.join(RUNS_DIR, name);
+        if (fs.existsSync(path.join(dir, "favorites.json"))) offsets.add(Number(m[1]));
+      }
+    }
+  } catch { /* ignore */ }
+  return offsets;
+}
+
+function mergeCollectedFavorites() {
   const slices = [];
-  let offset = 0;
+  const seen = new Set();
+  const offsets = findExistingCollectOffsets();
+  for (const off of [...offsets].sort((a, b) => a - b)) {
+    const dir = path.join(RUNS_DIR, `_collect_${String(off).padStart(4, "0")}`);
+    try {
+      const fav = readJson(path.join(dir, "favorites.json")).favorites || [];
+      for (const f of fav) {
+        if (f.aweme_id && !seen.has(f.aweme_id)) { seen.add(f.aweme_id); slices.push(f); }
+      }
+    } catch { /* ignore */ }
+  }
+  return slices;
+}
+
+async function collectPerSlice() {
+  const MAX_PAGES = process.argv.includes("--max-pages")
+    ? Number(process.argv[process.argv.indexOf("--max-pages") + 1]) : Infinity;
+
+  // 断点续采：从已有最大 offset 之后开始
+  const existing = findExistingCollectOffsets();
+  let offset = existing.size ? Math.max(...existing) + SLICE_SIZE : 0;
+  if (existing.size) log(`断点续采：已存在 ${existing.size} 页，从 offset=${offset} 继续`);
+
+  let pagesThisRun = 0;
   let emptyStreak = 0;
-  while (emptyStreak < 2) {
+  while (emptyStreak < EMPTY_STOP && pagesThisRun < MAX_PAGES) {
     const outDir = path.join(RUNS_DIR, `_collect_${String(offset).padStart(4, "0")}`);
     let count = 0;
-    try {
-      log(`collect offset=${offset} (limit=${SLICE_SIZE}) ...`);
-      const { stdout } = await runOpencli([
-        path.join(PROJECT_ROOT, "src", "cli.mjs"), "collect",
-        "--limit", String(SLICE_SIZE), "--offset", String(offset), "--out", outDir,
-      ]);
-      const m = stdout.match(/"count":\s*(\d+)/);
-      count = m ? Number(m[1]) : 0;
-    } catch (err) {
-      log(`  ✗ collect 失败: ${err.message.split("\n")[0]}（可能限频，重试前等待）`);
-      await new Promise(r => setTimeout(r, COLLECT_INTERVAL * 2));
+    let ok = false;
+    for (let attempt = 1; attempt <= COLLECT_RETRIES && !ok; attempt++) {
+      try {
+        log(`collect offset=${offset} (limit=${SLICE_SIZE}, 尝试 ${attempt}/${COLLECT_RETRIES}) ...`);
+        const { stdout } = await runOpencli([
+          path.join(PROJECT_ROOT, "src", "cli.mjs"), "collect",
+          "--limit", String(SLICE_SIZE), "--offset", String(offset), "--out", outDir,
+        ]);
+        const m = stdout.match(/"count":\s*(\d+)/);
+        count = m ? Number(m[1]) : 0;
+        ok = true;
+      } catch (err) {
+        log(`  ✗ collect 失败: ${err.message.split("\n")[0]}（重试前等待）`);
+        await new Promise(r => setTimeout(r, COLLECT_INTERVAL * 2));
+      }
+    }
+    if (!ok) {
+      log(`  ⚠️ offset=${offset} 重试 ${COLLECT_RETRIES} 次仍失败，跳过本页继续`);
+      offset += SLICE_SIZE;
+      emptyStreak++;
+      pagesThisRun++;
       continue;
     }
     if (count === 0) {
       emptyStreak++;
-      log(`  offset=${offset} 返回 0 条（空 ${emptyStreak}/2）`);
+      log(`  offset=${offset} 返回 0 条（空 ${emptyStreak}/${EMPTY_STOP}）`);
     } else {
       emptyStreak = 0;
-      const fav = readJson(path.join(outDir, "favorites.json")).favorites || [];
-      slices.push(...fav);
-      log(`  累计 ${slices.length} 条`);
+      log(`  本页 ${count} 条`);
     }
     offset += SLICE_SIZE;
+    pagesThisRun++;
     if (count > 0) await new Promise(r => setTimeout(r, COLLECT_INTERVAL));
   }
+
+  // 落盘合并结果（无论是否到末尾都写，支持分段）
+  const all = mergeCollectedFavorites();
   writeJson(path.join(FULL_DIR, "favorites.json"), {
     schema_version: 1, captured_at: new Date().toISOString(),
-    source: "batch-organize collectPerSlice", count: slices.length, favorites: slices,
+    source: "batch-organize collectPerSlice", count: all.length, favorites: all,
   });
-  log(`全量采集完成: ${slices.length} 条`);
-  return slices;
+  const reachedEnd = emptyStreak >= EMPTY_STOP;
+  log(`本次采集 ${pagesThisRun} 页，累计合并 ${all.length} 条${reachedEnd ? "（已到末尾）" : "（可重跑续采）"}`);
+  return all;
 }
 
 function sliceFavorites(allFavorites) {
