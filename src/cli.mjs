@@ -1,8 +1,8 @@
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectFavorites } from "./collector.mjs";
-import { writeDraftPlan } from "./classifier.mjs";
+import { writeDraftPlan, loadTaxonomy } from "./classifier.mjs";
 import { approvePlan, approvalToken, buildApplyManifest, validatePlan } from "./plan.mjs";
 import { readJson, writeJson, writeText } from "./io.mjs";
 import { renderPreview } from "./preview.mjs";
@@ -43,6 +43,7 @@ async function main() {
   if (command === "collect") {
     const result = await collectFavorites({
       limit: args.limit ? Number(args.limit) : 200,
+      offset: args.offset ? Number(args.offset) : 0,
       outputDirectory: args.out ? path.resolve(args.out) : undefined,
     });
     process.stdout.write(`${JSON.stringify({ ok: true, run: result.directory, count: result.source.count, coverage_warning: result.source.coverage_warning }, null, 2)}\n`);
@@ -50,12 +51,19 @@ async function main() {
   }
   if (command === "draft") {
     const run = resolveRun(args);
+    const taxonomy = loadTaxonomy(args.taxonomy || null);
     const result = writeDraftPlan(run, {
       minimumConfidence: args.minimum_confidence ? Number(args.minimum_confidence) : 0.58,
       uncertainFolder: args.uncertain_folder || "待确认",
       folderVisibility: args.folder_visibility || "private",
+      taxonomy,
     });
-    process.stdout.write(`${JSON.stringify({ ok: true, plan: result.file, assignments: result.plan.assignments.length }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      plan: result.file,
+      assignments: result.plan.assignments.length,
+      taxonomy: taxonomy ? taxonomy.source : "default(13类)",
+    }, null, 2)}\n`);
     return;
   }
   if (command === "incremental") {
