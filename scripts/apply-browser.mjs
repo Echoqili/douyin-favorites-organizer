@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { appendJournal } from "../src/journal.mjs";
+import { applyAllFolderBatches } from "../src/apply-all.mjs";
 import { browserSessionPolicy, douyinFavoritesUrl } from "../src/browser-session-policy.mjs";
 import { partitionMappedTargets, targetCheckboxSelector } from "../src/browser-selection.mjs";
 
@@ -54,6 +55,13 @@ function runOpencli(args, { json = true } = {}) {
 const browser = (...args) => runOpencli(["browser", SESSION, ...args]);
 const evaluate = js => browser("eval", js);
 const wait = seconds => runOpencli(["browser", SESSION, "wait", "time", String(seconds)], { json: false });
+const browserOn = (targetPage, ...args) => targetPage
+  ? runOpencli(["browser", SESSION, ...args, "--tab", targetPage])
+  : browser(...args);
+const evaluateOn = (targetPage, js) => browserOn(targetPage, "eval", js);
+const waitOn = (targetPage, seconds) => targetPage
+  ? runOpencli(["browser", SESSION, "wait", "time", String(seconds), "--tab", targetPage], { json: false })
+  : wait(seconds);
 
 async function ensureSession({ windowMode = "background", resetExisting = false } = {}) {
   if (resetExisting) {
@@ -74,8 +82,8 @@ async function ensureSession({ windowMode = "background", resetExisting = false 
   }
 }
 
-async function clickTab(id) {
-  const result = await evaluate(`(() => {
+async function clickTab(id, targetPage = null) {
+  const result = await evaluateOn(targetPage, `(() => {
     const tab = document.getElementById(${JSON.stringify(id)});
     if (!tab || !(tab.offsetWidth || tab.offsetHeight)) return { clicked: false };
     if (tab.getAttribute('aria-selected') === 'true') return { clicked: true, alreadySelected: true };
@@ -94,13 +102,13 @@ async function clickTab(id) {
     return { clicked: true };
   })()`);
   if (!result.clicked) throw new Error(`Required tab is missing: ${id}`);
-  await wait(1.5);
-  const selected = await evaluate(`(() => document.getElementById(${JSON.stringify(id)})?.getAttribute('aria-selected'))()`);
+  await waitOn(targetPage, 1.5);
+  const selected = await evaluateOn(targetPage, `(() => document.getElementById(${JSON.stringify(id)})?.getAttribute('aria-selected'))()`);
   if (selected !== "true" && selected !== true) throw new Error(`Tab did not become selected: ${id}`);
 }
 
-async function clickExactText(text) {
-  const result = await evaluate(`(() => {
+async function clickExactText(text, targetPage = null) {
+  const result = await evaluateOn(targetPage, `(() => {
     const candidates = [...document.querySelectorAll('*')]
       .filter(element => element.innerText?.trim() === ${JSON.stringify(text)} && (element.offsetWidth || element.offsetHeight));
     const target = candidates.find(element => element.children.length === 0) || candidates.at(-1);
@@ -152,9 +160,9 @@ async function folderVisible(name) {
   })()`);
 }
 
-async function folderCount(name) {
-  await clickTab("semiTabfavorite_folder");
-  return evaluate(`(() => {
+async function folderCount(name, targetPage = null) {
+  await clickTab("semiTabfavorite_folder", targetPage);
+  return evaluateOn(targetPage, `(() => {
     const label = [...document.querySelectorAll('*')].find(element =>
       element.innerText?.trim() === ${JSON.stringify(name)} && (element.offsetWidth || element.offsetHeight)
     );
@@ -372,6 +380,80 @@ async function selectTargetIds(targetIds) {
   }
 }
 
+async function submitSelectedToFolder(folder) {
+  await clickExactText("加入收藏夹");
+  await wait(0.7);
+
+  const chosen = await evaluate(`(() => {
+    const candidates = [...document.querySelectorAll('*')]
+      .filter(element => element.innerText?.trim() === ${JSON.stringify(folder)} && (element.offsetWidth || element.offsetHeight));
+    if (candidates.length !== 1) return { ok: false, error: 'missing or ambiguous folder', matches: candidates.length };
+    const row = candidates[0].parentElement?.parentElement;
+    const control = row?.querySelector('span.semi-checkbox');
+    if (!control) return { ok: false, error: 'missing folder checkbox' };
+    control.setAttribute('data-organizer-folder-checkbox', 'destination');
+    return { ok: true };
+  })()`);
+  if (!chosen.ok) throw new Error(`Could not choose destination folder: ${JSON.stringify(chosen)}`);
+  const folderClick = await browser("click", '[data-organizer-folder-checkbox="destination"]');
+  if (!folderClick.clicked || folderClick.matches_n !== 1) throw new Error(`Destination checkbox click failed: ${JSON.stringify(folderClick)}`);
+  await wait(0.4);
+
+  const confirmation = await evaluate(`(() => {
+    const destination = document.querySelector('[data-organizer-folder-checkbox="destination"] input[type=checkbox]');
+    const buttons = [...document.querySelectorAll('button')]
+      .filter(element => element.innerText.trim() === '确定' && (element.offsetWidth || element.offsetHeight));
+    if (!destination?.checked || buttons.length !== 1 || buttons[0].disabled) {
+      return { ready: false, destinationChecked: destination?.checked ?? false, matches: buttons.length, disabled: buttons[0]?.disabled };
+    }
+    buttons[0].setAttribute('data-organizer-confirm', 'destination');
+    return { ready: true };
+  })()`);
+  if (!confirmation.ready) throw new Error(`Destination confirmation is ambiguous: ${JSON.stringify(confirmation)}`);
+  const confirmClick = await browser("click", '[data-organizer-confirm="destination"]');
+  if (!confirmClick.clicked || confirmClick.matches_n !== 1) throw new Error(`Destination confirm click failed: ${JSON.stringify(confirmClick)}`);
+}
+
+async function writerReadyState() {
+  return evaluate(`(() => {
+    const managementOpen = document.body.innerText.includes('退出管理');
+    const addAction = document.body.innerText.includes('加入收藏夹');
+    const cancelGuard = document.body.innerText.includes('取消收藏');
+    const dialogOpen = [...document.querySelectorAll('[role=dialog]')]
+      .some(element => element.offsetWidth || element.offsetHeight);
+    const checked = [...document.querySelectorAll('input[type=checkbox]')]
+      .filter(element => element.checked).length;
+    if (!dialogOpen && checked === 0) {
+      for (const element of document.querySelectorAll('[data-organizer-target]')) {
+        element.removeAttribute('data-organizer-target');
+      }
+    }
+    return {
+      ready: managementOpen && addAction && cancelGuard && !dialogOpen && checked === 0,
+      managementOpen,
+      addAction,
+      cancelGuard,
+      dialogOpen,
+      checked,
+    };
+  })()`);
+}
+
+function exactBatchVerified(runDirectory, folder, ids) {
+  const journalFile = path.join(runDirectory, "apply-journal.jsonl");
+  if (!fs.existsSync(journalFile)) return false;
+  const expected = JSON.stringify([...ids].map(String).sort());
+  return fs.readFileSync(journalFile, "utf8")
+    .split(/\r?\n/u)
+    .filter(Boolean)
+    .map(line => JSON.parse(line))
+    .some(entry => {
+      const recorded = [...(entry.aweme_ids || [])].map(String).sort();
+      return entry.status === "verified" && entry.folder === folder
+        && JSON.stringify(recorded) === expected;
+    });
+}
+
 function recordUnavailableIds(runDirectory, folder, ids) {
   if (!ids.length) return;
   const file = path.join(runDirectory, "unavailable-video-ids.json");
@@ -391,14 +473,7 @@ function recordUnavailableIds(runDirectory, folder, ids) {
 
 async function addFolderBatch(folder, videos, runDirectory) {
   const ids = videos.map(video => String(video.aweme_id));
-  const journalFile = path.join(runDirectory, "apply-journal.jsonl");
-  const priorVerified = fs.existsSync(journalFile)
-    ? fs.readFileSync(journalFile, "utf8").split(/\r?\n/u).filter(Boolean).map(line => JSON.parse(line)).some(entry => {
-      const recorded = [...(entry.aweme_ids || [])].map(String).sort();
-      return entry.status === "verified" && entry.folder === folder
-        && JSON.stringify(recorded) === JSON.stringify([...ids].sort());
-    })
-    : false;
+  const priorVerified = exactBatchVerified(runDirectory, folder, ids);
   if (priorVerified) {
     appendJournal(runDirectory, { folder, ids, status: "verified", verifiedCount: ids.length, evidence: "exact batch already verified in journal" });
     return { folder, status: "already-verified", videos: ids.length, verifiedCount: ids.length };
@@ -437,37 +512,7 @@ async function addFolderBatch(folder, videos, runDirectory) {
     }
     const expectedCount = beforeCount + attemptedIds.length;
     await selectTargetIds(attemptedIds);
-    await clickExactText("加入收藏夹");
-    await wait(0.7);
-
-    const chosen = await evaluate(`(() => {
-      const candidates = [...document.querySelectorAll('*')]
-        .filter(element => element.innerText?.trim() === ${JSON.stringify(folder)} && (element.offsetWidth || element.offsetHeight));
-      if (candidates.length !== 1) return { ok: false, error: 'missing or ambiguous folder', matches: candidates.length };
-      const row = candidates[0].parentElement?.parentElement;
-      const control = row?.querySelector('span.semi-checkbox');
-      if (!control) return { ok: false, error: 'missing folder checkbox' };
-      control.setAttribute('data-organizer-folder-checkbox', 'destination');
-      return { ok: true };
-    })()`);
-    if (!chosen.ok) throw new Error(`Could not choose destination folder: ${JSON.stringify(chosen)}`);
-    const folderClick = await browser("click", '[data-organizer-folder-checkbox="destination"]');
-    if (!folderClick.clicked || folderClick.matches_n !== 1) throw new Error(`Destination checkbox click failed: ${JSON.stringify(folderClick)}`);
-    await wait(0.4);
-
-    const confirmation = await evaluate(`(() => {
-      const destination = document.querySelector('[data-organizer-folder-checkbox="destination"] input[type=checkbox]');
-      const buttons = [...document.querySelectorAll('button')]
-        .filter(element => element.innerText.trim() === '确定' && (element.offsetWidth || element.offsetHeight));
-      if (!destination?.checked || buttons.length !== 1 || buttons[0].disabled) {
-        return { ready: false, destinationChecked: destination?.checked ?? false, matches: buttons.length, disabled: buttons[0]?.disabled };
-      }
-      buttons[0].setAttribute('data-organizer-confirm', 'destination');
-      return { ready: true };
-    })()`);
-    if (!confirmation.ready) throw new Error(`Destination confirmation is ambiguous: ${JSON.stringify(confirmation)}`);
-    const confirmClick = await browser("click", '[data-organizer-confirm="destination"]');
-    if (!confirmClick.clicked || confirmClick.matches_n !== 1) throw new Error(`Destination confirm click failed: ${JSON.stringify(confirmClick)}`);
+    await submitSelectedToFolder(folder);
     submitStarted = true;
     for (let attempt = 0; attempt < 10; attempt += 1) {
       await wait(0.45);
@@ -500,6 +545,68 @@ async function addFolderBatch(folder, videos, runDirectory) {
       appendJournal(runDirectory, { folder, ids: attemptedIds, status: "failed", verifiedCount: 0, evidence: "stopped before destination confirmation" });
     }
     throw error;
+  }
+}
+
+async function createVerifierTab() {
+  const created = await browser("tab", "new", SELF_URL);
+  const targetPage = String(created?.page || "").trim();
+  if (!targetPage) throw new Error(`Could not create an independent verifier tab: ${JSON.stringify(created)}`);
+  await browserOn(targetPage, "open", SELF_URL);
+  await waitOn(targetPage, 1);
+  return targetPage;
+}
+
+async function readFolderCounts(targetPage, folders) {
+  const counts = {};
+  for (const folder of [...new Set(folders.map(String))]) {
+    const count = await folderCount(folder, targetPage);
+    if (count < 0) throw new Error(`Folder is missing or unreadable in verifier tab: ${folder}`);
+    counts[folder] = count;
+  }
+  return counts;
+}
+
+async function verifyFolderCountInTab(targetPage, folder, expectedCount) {
+  await browserOn(targetPage, "open", SELF_URL);
+  await waitOn(targetPage, 0.5);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const actualCount = await folderCount(folder, targetPage);
+    if (actualCount === expectedCount) return true;
+    await waitOn(targetPage, 0.45);
+  }
+  return false;
+}
+
+async function applyAllBatches(manifest, runDirectory) {
+  const verifierTab = await createVerifierTab();
+  try {
+    return await applyAllFolderBatches({
+      batches: manifest.add_to_folders,
+      browser: {
+        readFolderCounts: folders => readFolderCounts(verifierTab, folders),
+        scanTargets: async ids => {
+          await enterManagement();
+          return loadTargetIds(ids);
+        },
+        selectTargets: selectTargetIds,
+        submitToFolder: async folder => {
+          await submitSelectedToFolder(folder);
+          await wait(0.7);
+        },
+        verifyWriterReady: writerReadyState,
+        verifyFolderCount: (folder, expectedCount) => verifyFolderCountInTab(verifierTab, folder, expectedCount),
+      },
+      journal: entry => appendJournal(runDirectory, entry),
+      recordUnavailable: (folder, ids) => recordUnavailableIds(runDirectory, folder, ids),
+      isBatchVerified: batch => exactBatchVerified(
+        runDirectory,
+        batch.folder,
+        batch.videos.map(video => String(video.aweme_id)),
+      ),
+    });
+  } finally {
+    await browser("tab", "close", verifierTab).catch(() => {});
   }
 }
 
@@ -547,6 +654,44 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ ok: true, results }, null, 2)}\n`);
     return;
   }
+  if (command === "apply-all") {
+    const unavailableFile = path.join(runDirectory, "unavailable-video-ids.json");
+    const unavailableDocument = fs.existsSync(unavailableFile)
+      ? JSON.parse(fs.readFileSync(unavailableFile, "utf8"))
+      : { entries: [] };
+    const knownUnavailable = new Set((unavailableDocument.entries || []).map(entry => String(entry.aweme_id)));
+    const skipped = manifest.add_to_folders.flatMap(batch => batch.videos
+      .filter(video => knownUnavailable.has(String(video.aweme_id)))
+      .map(video => ({ folder: batch.folder, video })));
+    for (const item of skipped) {
+      appendJournal(runDirectory, {
+        folder: item.folder,
+        ids: [item.video.aweme_id],
+        status: "unavailable",
+        verifiedCount: 0,
+        evidence: "not rendered in Douyin batch management UI after one shared bounded scan",
+      });
+    }
+    const preparedManifest = {
+      ...manifest,
+      add_to_folders: manifest.add_to_folders
+        .map(batch => ({
+          ...batch,
+          videos: batch.videos.filter(video => !knownUnavailable.has(String(video.aweme_id))),
+        }))
+        .filter(batch => batch.videos.length > 0),
+    };
+    const result = preparedManifest.add_to_folders.length
+      ? await applyAllBatches(preparedManifest, runDirectory)
+      : { ok: true, scan_passes: 0, mapped_videos: 0, unavailable_videos: 0, results: [] };
+    process.stdout.write(`${JSON.stringify({
+      ...result,
+      unavailable_videos: result.unavailable_videos + skipped.length,
+      previously_unavailable: skipped.length,
+      planned: manifest.add_to_folders.reduce((sum, batch) => sum + batch.videos.length, 0),
+    }, null, 2)}\n`);
+    return;
+  }
   if (command === "add-folder") {
     if (!args.folder) throw new Error("--folder is required");
     const batch = manifest.add_to_folders.find(item => item.folder === args.folder);
@@ -573,7 +718,7 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ ok: true, result, unavailable: skipped.length, planned: batch.videos.length }, null, 2)}\n`);
     return;
   }
-  throw new Error("Use inspect-folders, preflight, create-folders, add-folder, or close");
+  throw new Error("Use inspect-folders, preflight, create-folders, apply-all, add-folder, or close");
 }
 
 main().catch(async error => {
