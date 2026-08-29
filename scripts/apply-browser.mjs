@@ -142,8 +142,9 @@ async function safeExitManagement() {
       return { exited: true, via: label };
     }
   }
-  // 兜底：直接重开收藏视频页，强制脱离管理态（不抛错）
-  await evaluate(`(() => { window.location.href = ${JSON.stringify(SELF_URL)}; return true; })()`).catch(() => {});
+  // 兜底：重开「收藏视频」子标签（而非裸 SELF_URL），避免离开后 semiTabfavorite_folder 不可见，
+  // 导致下一夹的 folderCount/clickTab 误报 "Required tab is missing"
+  await evaluate(`(() => { window.location.href = ${JSON.stringify(`${SELF_URL}&showSubTab=favorite_video`)}; return true; })()`).catch(() => {});
   await wait(0.8);
   return { exited: true, via: "reopen-url" };
 }
@@ -191,6 +192,14 @@ async function folderVisible(name) {
 }
 
 async function folderCount(name) {
+  // 退出管理态后页面可能已离开收藏视频子标签（semiTabfavorite_folder 不可见），
+  // 这里先确保停在收藏视频页，否则 clickTab 会误报 "Required tab is missing"。
+  // 与 enterManagement 复用同一判断，修复「每批第 1 夹成功、第 2 夹起全失败」的问题。
+  const onVideoPage = await evaluate("(() => location.href.includes('favorite_video'))()").catch(() => false);
+  if (!onVideoPage) {
+    await browser("open", `${SELF_URL}&showSubTab=favorite_video`, "--window", "foreground");
+    await wait(2.5);
+  }
   await clickTab("semiTabfavorite_folder");
   return evaluate(`(() => {
     const label = [...document.querySelectorAll('*')].find(element =>
@@ -418,14 +427,25 @@ async function enterManagement() {
 }
 
 // 单批目标上限：抖音批量管理懒加载全部视频会撑爆 Chrome 内存导致崩溃，
-// 因此每批只处理少量目标，且只滚动到覆盖"已出现目标 + 有限额外加载"为止，绝不无限滚动到底。
+// 因此每批只处理少量目标。但"渲染到覆盖目标即停"，绝不无脑滚到底。
 const TARGET_BATCH_CAP = 25;
-const LOAD_ATTEMPT_CAP = 30; // 每批最多滚动轮数，超出即停止（保护浏览器）
-const LOAD_STABLE_STOP = 8;  // 连续 N 轮无新增渲染才停（给抖音懒加载留足时间，减少漏判）
-// 加强加载模式：用于 unavailable 长尾重试——懒加载视频可能需要很多轮才渲染，
-// 放宽稳定停止阈值与轮数上限，给抖音前端更多时间把视频挂出来。
-const LOAD_ATTEMPT_CAP_AGGRESSIVE = 60;
-const LOAD_STABLE_STOP_AGGRESSIVE = 20;
+// 突破"827 假上限"：此前 LOAD_ATTEMPT_CAP=30 + LOAD_STABLE_STOP=8 让滚动提前停止，
+// 实际虚拟列表可渲染全量收藏（只读探针暴力滚动 150 轮即渲染 2436 个 checkbox；
+// 深滚到全量 ~3000+ 亦可，未崩溃）。放宽到足以覆盖全量收藏并保留内存安全余量。
+const LOAD_ATTEMPT_CAP = 600;            // 普通模式最多滚动轮数（只读探针验证全量收藏 ~5000 需 ~520 轮，留余量）
+const LOAD_STABLE_STOP = 25;             // 连续 25 轮无新增才认定"已渲染完"，避免懒加载间隙误停
+// 加强加载模式：用于 unavailable 长尾重试——懒加载视频可能需要更多轮才渲染。
+// 抖音批量管理懒加载有"间隙"（某些轮次滚了但不立即挂载新节点），stableStop 设太小会在间隙期
+// 误判"已滚到底"而提前停（实测 stableStop=40 时 mapped 只到 349 就停）。探针 400 轮能到 4707，
+// 故 aggressive 下放宽到 stableStop=160、attemptCap=1400，确保最深的收藏（position ~5000）也能被滚到。
+const LOAD_ATTEMPT_CAP_AGGRESSIVE = 1400;
+const LOAD_STABLE_STOP_AGGRESSIVE = 160;
+// 内存安全上限：渲染中的 checkbox 数超过此值即停止滚动（仅作极端账号兜底，避免撑爆 Chrome 崩溃）。
+// 探针验证渲染 4707 个 checkbox 未崩溃；本账户全量收藏约 5000 量级，故阈值取到 6000，
+// 真实场景不会触发（触发时仍未命中的目标记为 unavailable，交由后续策略/手动处理）。
+const MAX_RENDERED_CHECKBOXES = 6000;
+// 每夹之间冷却（ms）：add-folder --all 连续处理多夹时，夹间留冷却，避免触发抖音"操作频繁"瞬时退化。
+const COOLDOWN_BETWEEN_FOLDERS = 8000;
 
 async function loadTargetIds(targetIds, { aggressive = false } = {}) {
   const attemptCap = aggressive ? LOAD_ATTEMPT_CAP_AGGRESSIVE : LOAD_ATTEMPT_CAP;
@@ -441,38 +461,58 @@ async function loadTargetIds(targetIds, { aggressive = false } = {}) {
     process.stderr.write(`[LOADTARGET] bridge probe FAILED: ${e.message}\n`);
     throw e;
   }
-  for (; attempt < attemptCap; attempt += 1) {
-    const mapped = await evaluate(mappingExpression);
-    const ids = new Set(mapped.map(item => item.id));
-    if (targetIds.every(id => ids.has(id))) {
-      return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: attempt + 1 };
+  // 注意：不要在这里做 scrollToTop 复位！抖音批量管理用底部 IntersectionObserver 哨兵触发懒加载，
+  // 强制 window/容器 scrollTop=0 反而会让哨兵脱离视口、无法触发加载（实测只能渲染 ~24 个 checkbox）。
+  // 进入管理态后由 enterManagement 自然停留在顶部即可，深滚由下方 scrollOnce 负责。
+  await wait(0.3);
+  // 性能优化：稳定（checkbox 数无新增）的轮次只做廉价计数，不做耗时的全量 ID 抽取；
+  // 仅当 checkbox 数增长（有新视频挂载）时才跑 mappingExpression 抽取 ID 并比对目标。
+  // 这样深滚到全量收藏（~5000）也不会每轮都遍历全部 checkbox 拖垮 Chrome。
+  const cheapCount = "(() => document.querySelectorAll('input[type=checkbox]').length)()";
+  const scrollOnce = `(() => {
+    const boxes = [...document.querySelectorAll('input[type=checkbox]')];
+    const last = boxes.at(-1);
+    last?.scrollIntoView({ block: 'end', inline: 'nearest' });
+    const scrollers = [...document.querySelectorAll('*')].filter(element => {
+      if (element.scrollHeight <= element.clientHeight + 80) return false;
+      if (element.clientHeight < 150) return false;
+      const overflow = getComputedStyle(element).overflowY;
+      return overflow === 'auto' || overflow === 'scroll';
+    });
+    for (const scroller of scrollers) {
+      scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(400, Math.floor(scroller.clientHeight * 0.6)));
     }
-    if (ids.size === previous) stable += 1;
-    else stable = 0;
-    previous = ids.size;
-    // 连续 N 轮没有新增渲染（说明这一屏能加载的都加载了），停止滚动，避免崩溃
-    if (stable >= stableStop) break;
-    await evaluate(`(() => {
-      const boxes = [...document.querySelectorAll('input[type=checkbox]')];
-      const last = boxes.at(-1);
-      // 仅把最后一个 checkbox 滚入视口，触发抖音懒加载（不滚 window，不滚到最底）
-      last?.scrollIntoView({ block: 'end', inline: 'nearest' });
-      // 只驱动视频网格自身的滚动容器，不碰 window / body
-      const scrollers = [...document.querySelectorAll('*')].filter(element => {
-        if (element.scrollHeight <= element.clientHeight + 80) return false;
-        if (element.clientHeight < 150) return false;
-        const overflow = getComputedStyle(element).overflowY;
-        return overflow === 'auto' || overflow === 'scroll';
-      });
-      for (const scroller of scrollers) {
-        scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(400, Math.floor(scroller.clientHeight * 0.6)));
+    return boxes.length;
+  })()`;
+  let ids = new Set();
+  let lastExtractedCount = -1;
+  for (; attempt < attemptCap; attempt += 1) {
+    const count = await evaluate(cheapCount).catch(() => lastExtractedCount);
+    // 仅当首次或 checkbox 数增长时才做全量 ID 抽取与比对
+    if (count !== lastExtractedCount) {
+      const mapped = await evaluate(mappingExpression);
+      ids = new Set(mapped.map(item => item.id));
+      lastExtractedCount = count;
+      if (targetIds.every(id => ids.has(id))) {
+        return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: attempt + 1 };
       }
-      return { boxes: boxes.length, scrollers: scrollers.length };
-    })()`);
+    }
+    if (count === previous) stable += 1;
+    else stable = 0;
+    previous = count;
+    // 内存安全：渲染中的 checkbox 数逼近上限即停止滚动（避免撑爆 Chrome 崩溃）。
+    if (count >= MAX_RENDERED_CHECKBOXES) {
+      process.stderr.write(`[LOADTARGET] reached MAX_RENDERED_CHECKBOXES=${MAX_RENDERED_CHECKBOXES}; stop scrolling (targets beyond cap -> unavailable)\n`);
+      break;
+    }
+    // 连续 N 轮没有新增渲染（说明这一屏能加载的都加载了），停止滚动
+    if (stable >= stableStop) break;
+    await evaluate(scrollOnce);
     await wait(0.5);
   }
-  const final = await evaluate(mappingExpression);
-  const ids = new Set(final.map(item => item.id));
+  // 退出前用一次全量抽取确保 ids 最新（末尾可能最后一增长轮后又有细微变动）
+  const final = await evaluate(mappingExpression).catch(() => []);
+  ids = new Set(final.map(item => item.id));
   process.stderr.write(`[LOADTARGET] mapped=${ids.size} targetPresent=${targetIds.filter(id => ids.has(id)).length}/${targetIds.length} attempts=${attempt}\n`);
   return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: attempt };
 }
@@ -751,6 +791,119 @@ async function main() {
     process.stdout.write(`${JSON.stringify(await inspectFolders(), null, 2)}\n`);
     return;
   }
+  if (command === "inspect-video-ui") {
+    // 复用已经验证过的 enterManagement 进入批量管理态（它会重试点击并轮询确认控件出现），
+    // 不再自行 clickExactText 吞错——之前探针失败就是因为批量管理态没真正进入。
+    await enterManagement();
+    const scrollCap = Number.isFinite(Number(args.scroll_cap)) ? Number(args.scroll_cap) : 150;
+    // 1) 结构性 dump：按钮、菜单项、输入、疑似排序控件、当前 checkbox 数
+    const controls = await evaluate(`(() => {
+      const visible = el => el && (el.offsetWidth || el.offsetHeight);
+      const buttons = [...document.querySelectorAll('button')].filter(visible).map(b => b.innerText.trim()).filter(Boolean);
+      const roles = [...document.querySelectorAll('[role=option],[role=menuitem],[role=tab],[role=listbox],[role=menu]')]
+        .filter(visible).map(el => ({ role: el.getAttribute('role'), text: el.innerText.trim().slice(0, 40) }))
+        .filter(e => e.text);
+      const inputs = [...document.querySelectorAll('input')].map(i => ({ ph: i.getAttribute('placeholder'), type: i.type, cls: String(i.className || '').slice(0, 80) })).filter(i => i.ph || i.type);
+      const sortish = [...document.querySelectorAll('*')].filter(el => visible(el) && /(排序|最新|最旧|默认排序|综合排序|时间排序)/.test(el.innerText || '') && (el.innerText || '').trim().length < 24)
+        .map(el => ({ tag: el.tagName, cls: String(el.className || '').slice(0, 80), text: el.innerText.trim() }));
+      const selectAll = [...document.querySelectorAll('*')].filter(el => visible(el) && (el.innerText || '').trim() === '全选').map(el => el.tagName);
+      const checkboxNow = document.querySelectorAll('input[type=checkbox]').length;
+      const totalMatch = document.body.innerText.match(/共\\s*(\\d+)\\s*作品/);
+      return {
+        inBatch: document.body.innerText.includes('退出管理'),
+        checkboxNow,
+        totalInHeader: totalMatch ? Number(totalMatch[1]) : -1,
+        buttons: [...new Set(buttons)],
+        roleTexts: [...new Set(roles.map(r => r.text))],
+        inputs,
+        sortish: [...new Set(sortish.map(s => s.text))],
+        sortishDetail: sortish.slice(0, 8),
+        selectAll,
+      };
+    })()`);
+    // 2) 暴力滚动，找虚拟列表硬上限（每轮复用 loadTargetIds 同款滚动逻辑）
+    let maxBoxes = controls.checkboxNow;
+    let lastSeen = controls.checkboxNow;
+    let stable = 0;
+    let plateauAt = -1;
+    const curve = [];
+    for (let i = 0; i < scrollCap; i += 1) {
+      const r = await evaluate(`(() => {
+        const boxes = [...document.querySelectorAll('input[type=checkbox]')];
+        const last = boxes.at(-1);
+        last && last.scrollIntoView({ block: 'end', inline: 'nearest' });
+        const scrollers = [...document.querySelectorAll('*')].filter(element => {
+          if (element.scrollHeight <= element.clientHeight + 80) return false;
+          if (element.clientHeight < 150) return false;
+          const overflow = getComputedStyle(element).overflowY;
+          return overflow === 'auto' || overflow === 'scroll';
+        });
+        for (const scroller of scrollers) {
+          scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(400, Math.floor(scroller.clientHeight * 0.6)));
+        }
+        return document.querySelectorAll('input[type=checkbox]').length;
+      })()`).catch(() => lastSeen);
+      if (r > maxBoxes) maxBoxes = r;
+      if (r === lastSeen) { stable += 1; if (stable >= 30 && plateauAt < 0) plateauAt = i; }
+      else stable = 0;
+      lastSeen = r;
+      if (i % 20 === 0) curve.push(r);
+      await wait(0.35);
+    }
+    const finalCount = lastSeen;
+    const plateaued = plateauAt >= 0 && finalCount === maxBoxes;
+    // 3) 排序控件探测：点开疑似排序下拉，读取选项（只读，不改数据）
+    const sortProbe = await evaluate(`(() => {
+      const visible = el => el && (el.offsetWidth || el.offsetHeight);
+      const trigger = [...document.querySelectorAll('*')].find(el => visible(el) && /(排序|最新|最旧|默认排序|综合排序)/.test(el.innerText || '') && (el.innerText || '').trim().length < 24);
+      if (!trigger) return { found: false };
+      trigger.click();
+      return { found: true, text: trigger.innerText.trim(), tag: trigger.tagName, cls: String(trigger.className || '').slice(0, 80) };
+    })()`).catch(() => ({ found: false }));
+    await wait(0.9);
+    const sortOptions = sortProbe.found
+      ? await evaluate(`(() => [...document.querySelectorAll('[role=option],[role=menuitem],li')].map(el => el.innerText.trim()).filter(t => /(最新|最旧|默认|综合|时间)/.test(t)).filter(Boolean).slice(0, 20))()`).catch(() => [])
+      : [];
+    await safeExitManagement();
+    process.stdout.write(`${JSON.stringify({ controls, maxCheckbox: maxBoxes, finalCount, plateaued, plateauAt, scrollCap, curve, sortProbe, sortOptions: [...new Set(sortOptions)] }, null, 2)}\n`);
+    return;
+  }
+  if (command === "search-video-ui") {
+    // 只读验证：在批量管理态下用"搜索你收藏的作品"按标题子串定位某个（深的）视频，
+    // 确认搜索能把它从长尾里过滤出来并渲染出 checkbox。这是"突破 827"的内存安全路径。
+    if (!args.query) throw new Error("--query <text> is required for search-video-ui");
+    await enterManagement();
+    const setVal = await evaluate(`(() => {
+      const inp = [...document.querySelectorAll('input')].find(i => (i.getAttribute('placeholder') || '') === '搜索你收藏的作品');
+      if (!inp) return { ok: false };
+      // React 受控输入的值追踪器（_valueTracker）陷阱：直接走原型 setter 改 DOM 值后，
+      // React 比对话发现 tracker 值未变会认为没变化、不触发 onChange。先把 tracker 设为旧值，
+      // 让 React 在下一次 input 事件里读到"新 DOM 值 ≠ 旧 tracker 值"从而真正触发 onChange。
+      const oldValue = inp.value;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, ${JSON.stringify(args.query)});
+      if (inp._valueTracker) inp._valueTracker.setValue(oldValue);
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, value: inp.value };
+    })()`);
+    if (!setVal.ok) throw new Error("search input (搜索你收藏的作品) not found in batch mode");
+    let count = -1;
+    let found = false;
+    let ids = [];
+    for (let i = 0; i < 12; i += 1) {
+      await wait(0.6);
+      const r = await evaluate(mappingExpression).catch(() => []);
+      count = r.length;
+      ids = r.map(x => x.id);
+      if (args.expect_id) found = ids.some(id => String(id) === String(args.expect_id));
+      if (count > 0 && (found || !args.expect_id)) break;
+    }
+    const headerTotal = await evaluate("(() => { const m = document.body.innerText.match(/共\\s*(\\d+)\\s*作品/); return m ? Number(m[1]) : -1; })()").catch(() => -1);
+    await safeExitManagement();
+    process.stdout.write(`${JSON.stringify({ query: args.query, setOk: setVal.ok, checkboxCount: count, expectId: args.expect_id || null, foundExpected: args.expect_id ? found : null, sampleIds: ids.slice(0, 12), headerTotal }, null, 2)}\n`);
+    return;
+  }
   if (command === "close") {
     await runOpencli(["browser", SESSION, "close"], { json: false }).catch(() => {});
     process.stdout.write(`${JSON.stringify({ ok: true, closed: true }, null, 2)}\n`);
@@ -825,28 +978,31 @@ async function main() {
       // 一次进程跑完所有夹，复用同一个 session（只在首个夹 open 浏览器，
       // 后续 enterManagement 检测到已在视频页就不再 open），大幅减少 Chrome 启动抖动。
       process.stderr.write(`[ALL] start ${manifest.add_to_folders.length} folders\n`);
+      // --force 时忽略 unavailable 黑名单：突破 827 假上限后重跑，旧黑名单里记录的视频在放宽滚动预算下
+      // 其实已可渲染；若仍套用黑名单会把它们永远跳过（致命陷阱）。默认仍尊重黑名单以保护增量重跑。
+      const useBlacklist = args.force !== true;
       const unavailableFile = path.join(runDirectory, "unavailable-video-ids.json");
-      const unavailableDocument = fs.existsSync(unavailableFile)
+      const unavailableDocument = (useBlacklist && fs.existsSync(unavailableFile))
         ? JSON.parse(fs.readFileSync(unavailableFile, "utf8"))
         : { entries: [] };
       const unavailable = new Set((unavailableDocument.entries || []).map(entry => String(entry.aweme_id)));
       const allResults = [];
       for (const batch of manifest.add_to_folders) {
-        const skipped = batch.videos.filter(video => unavailable.has(String(video.aweme_id)));
-        const available = batch.videos.filter(video => !unavailable.has(String(video.aweme_id)));
+        const skipped = useBlacklist ? batch.videos.filter(video => unavailable.has(String(video.aweme_id))) : [];
+        const available = useBlacklist ? batch.videos.filter(video => !unavailable.has(String(video.aweme_id))) : batch.videos;
         if (skipped.length) {
           appendJournal(runDirectory, {
             folder: batch.folder,
             ids: skipped.map(video => video.aweme_id),
             status: "unavailable",
             verifiedCount: 0,
-            evidence: "not rendered in Douyin batch management UI after full scroll and search",
+            evidence: "suppressed by pre-bypass unavailable blacklist (rerun with --force to retry)",
           });
         }
       let result;
       try {
         result = available.length
-          ? await addFolderBatch(batch.folder, available, runDirectory)
+          ? await addFolderBatch(batch.folder, available, runDirectory, { aggressive: args.aggressive === true })
           : { folder: batch.folder, status: "unavailable", videos: 0, verifiedCount: 0 };
       } catch (error) {
         // 单夹失败（抖音界面偶发抖动）不中断整个批次：记录 failed 并继续下一夹，
@@ -856,6 +1012,28 @@ async function main() {
       }
       allResults.push(result);
       process.stderr.write(`[ALL] done folder=${batch.folder} status=${result.status} written=${result.verifiedCount ?? result.videos ?? 0}\n`);
+      // 每夹之间冷却，避免连续猛刷触发抖音"操作频繁"瞬时退化（第二道墙的次因）
+      await wait(COOLDOWN_BETWEEN_FOLDERS);
+      }
+      // 单轮后仍 unavailable/failed 的夹：冷却后整轮重试一次（滚动复位已修复根因，此处应对会话内瞬时退化），
+      // 仍失败才交由末尾 collectUnhandled 归集 未处理。
+      const retryTargets = allResults.filter(r => r && (r.status === "unavailable" || r.status === "failed"));
+      if (retryTargets.length) {
+        process.stderr.write(`[ALL] retry ${retryTargets.length} unavailable/failed folders after cooldown\n`);
+        await wait(COOLDOWN_BETWEEN_FOLDERS * 3);
+        for (const t of retryTargets) {
+          try {
+            const rb = manifest.add_to_folders.find(b => b.folder === t.folder);
+            if (!rb) continue;
+            const rr = await addFolderBatch(rb.folder, rb.videos, runDirectory, { aggressive: args.aggressive === true });
+            const idx = allResults.findIndex(x => x.folder === t.folder);
+            if (idx >= 0) allResults[idx] = rr;
+            process.stderr.write(`[ALL] retry done folder=${rb.folder} status=${rr.status} written=${rr.verifiedCount ?? rr.videos ?? 0}\n`);
+          } catch (e) {
+            process.stderr.write(`[ALL] retry FAILED folder=${t.folder}: ${e.message}\n`);
+          }
+          await wait(COOLDOWN_BETWEEN_FOLDERS);
+        }
       }
       process.stdout.write(`${JSON.stringify({ ok: true, results: allResults }, null, 2)}\n`);
       // 跑完后自动把本批 unavailable 归集到"未处理"夹（不阻塞主流程；失败仅记日志）

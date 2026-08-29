@@ -34,6 +34,8 @@ const FULL_DIR = path.join(RUNS_DIR, "_full");
 const STATE_FILE = path.join(RUNS_DIR, "_batch_state.json");
 
 const SLICE_SIZE = Number(process.argv.includes("--size") ? process.argv[process.argv.indexOf("--size") + 1] : 150);
+// 采集每页大小：默认 800（比 150 快 5 倍翻页，实测 800 可一次拉回满页），与切片大小独立
+const COLLECT_LIMIT = Number(process.argv.includes("--collect-limit") ? process.argv[process.argv.indexOf("--collect-limit") + 1] : 800);
 // 默认 limit=1000：覆盖全量收藏，又不至于像 3000 那样渲染超时（实测 500 已足够覆盖 295 条）
 const LIMIT = Number(process.argv.includes("--limit") ? process.argv[process.argv.indexOf("--limit") + 1] : 1000);
 const DO_COLLECT = !process.argv.includes("--no-collect");
@@ -41,6 +43,44 @@ const COLLECT_PER_SLICE = process.argv.includes("--collect-per-slice");
 const COLLECT_INTERVAL = Number(process.argv.includes("--collect-interval") ? process.argv[process.argv.indexOf("--collect-interval") + 1] : 8000); // ms 片间避让
 const APPLY_RETRIES = 3;
 const APPLY_RETRY_WAIT = 15_000; // ms
+
+// ── 登录态失效熔断 ───────────────────────────────────────────────
+// 根因：apply-browser.mjs 的 add-folder --all 对每个 folder 用 try/catch 包裹，
+// 单夹失败只记 failed 然后 continue，整体仍 ok:true + exit 0。登录态失效时所有 folder
+// 都会 failed（preflight / 批量管理 / semiTabfavorite_folder tab 缺失），但 batch-organize
+// 会误判 applied=true 标记 done，导致整批"done 但 0 写入"空转整夜。
+// 熔断：本片有视频要写却 written=0 且 failed>0 → 判定登录态失效，立即中断全批。
+class LoginInvalidError extends Error {
+  constructor(message) { super(message); this.name = "LoginInvalidError"; }
+}
+const LOGIN_INVALID_TEXT = [
+  /preflight failed/i,
+  /douyin favorites ui preflight/i,
+  /semiTabfavorite_folder/i,
+  /批量管理[^\n]*找不到|找不到[^\n]*批量管理/i,
+  /AUTH_REQUIRED/i,
+  /not logged in/i,
+];
+function isLoginInvalid(text) {
+  return LOGIN_INVALID_TEXT.some(p => p.test(String(text || "")));
+}
+function readJournalStats(dir) {
+  const jf = path.join(dir, "apply-journal.jsonl");
+  const stats = { verified: 0, failed: 0, unavailable: 0, other: 0, written: 0 };
+  if (!fs.existsSync(jf)) return stats;
+  for (const line of fs.readFileSync(jf, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const r = JSON.parse(line);
+      const v = Number(r.verifiedCount || r.written || 0);
+      if (r.status === "verified" || r.status === "already-verified") { stats.verified++; stats.written += v; }
+      else if (r.status === "failed") stats.failed++;
+      else if (r.status === "unavailable") stats.unavailable++;
+      else stats.other++;
+    } catch { /* ignore malformed line */ }
+  }
+  return stats;
+}
 
 const onlyArg = process.argv.includes("--only") ? process.argv[process.argv.indexOf("--only") + 1] : null;
 const ONLY_SLICES = onlyArg
@@ -142,7 +182,7 @@ async function collectPerSlice() {
 
   // 断点续采：从已有最大 offset 之后开始
   const existing = findExistingCollectOffsets();
-  let offset = existing.size ? Math.max(...existing) + SLICE_SIZE : 0;
+  let offset = existing.size ? Math.max(...existing) + COLLECT_LIMIT : 0;
   if (existing.size) log(`断点续采：已存在 ${existing.size} 页，从 offset=${offset} 继续`);
 
   let pagesThisRun = 0;
@@ -153,10 +193,10 @@ async function collectPerSlice() {
     let ok = false;
     for (let attempt = 1; attempt <= COLLECT_RETRIES && !ok; attempt++) {
       try {
-        log(`collect offset=${offset} (limit=${SLICE_SIZE}, 尝试 ${attempt}/${COLLECT_RETRIES}) ...`);
+        log(`collect offset=${offset} (limit=${COLLECT_LIMIT}, 尝试 ${attempt}/${COLLECT_RETRIES}) ...`);
         const { stdout } = await runOpencli([
           path.join(PROJECT_ROOT, "src", "cli.mjs"), "collect",
-          "--limit", String(SLICE_SIZE), "--offset", String(offset), "--out", outDir,
+          "--limit", String(COLLECT_LIMIT), "--offset", String(offset), "--out", outDir,
         ]);
         const m = stdout.match(/"count":\s*(\d+)/);
         count = m ? Number(m[1]) : 0;
@@ -168,7 +208,7 @@ async function collectPerSlice() {
     }
     if (!ok) {
       log(`  ⚠️ offset=${offset} 重试 ${COLLECT_RETRIES} 次仍失败，跳过本页继续`);
-      offset += SLICE_SIZE;
+      offset += COLLECT_LIMIT;
       emptyStreak++;
       pagesThisRun++;
       continue;
@@ -180,7 +220,7 @@ async function collectPerSlice() {
       emptyStreak = 0;
       log(`  本页 ${count} 条`);
     }
-    offset += SLICE_SIZE;
+    offset += COLLECT_LIMIT;
     pagesThisRun++;
     if (count > 0) await new Promise(r => setTimeout(r, COLLECT_INTERVAL));
   }
@@ -300,6 +340,10 @@ async function processSlice(index, slice, state) {
       ], { json: false, logFile: path.join(dir, "apply.log") });
       applied = true;
     } catch (err) {
+      if (isLoginInvalid(err.message)) {
+        log(`  🔴 登录态失效熔断（preflight/未登录）：${err.message.split("\n")[0]}`);
+        throw new LoginInvalidError(err.message);
+      }
       log(`  ✗ apply 失败: ${err.message.split("\n")[0]}`);
       if (attempt < APPLY_RETRIES) {
         log(`  等待 ${APPLY_RETRY_WAIT / 1000}s 后重试...`);
@@ -314,6 +358,16 @@ async function processSlice(index, slice, state) {
     log(`  已关闭 session=batch-${index + 1} 浏览器窗口（释放内存）`);
   } catch { /* ignore */ }
 
+  // 登录态失效熔断：apply 整体 exit 0（误判成功）但本片实际 0 写入
+  // → 抖音登录态已失效（批量管理 UI 打开后视频 checkbox 渲染不出，记成 unavailable 而非 failed），
+  //   继续跑只会整批空转。立即中断全批，等用户重新登录后续跑。
+  // 规则：本片 intended>0 且 written=0 且 (有失败 或 0 成功) → 系统性失效，熔断。
+  //   正常懒加载降级会有 verified>0（如 6 verified + 8 unavailable），不误触。
+  const js = readJournalStats(dir);
+  if (slice.length > 0 && js.written === 0 && (js.failed > 0 || js.verified === 0)) {
+    log(`  🔴 登录态失效熔断：片#${index + 1} 写入 0 条（verified=${js.verified} failed=${js.failed} unavailable=${js.unavailable}）。疑似抖音登录态失效或系统性 UI 故障，停止后续写入。`);
+    throw new LoginInvalidError(`片#${index + 1} 写入 0 条（verified=${js.verified} failed=${js.failed}），疑似抖音登录态失效`);
+  }
   if (applied) {
     state.slices[dirName] = { status: "done", count: slice.length, assignments, at: new Date().toISOString() };
     log(`  ✓ #${index + 1} 完成`);
@@ -367,10 +421,26 @@ async function main() {
 
   if (PARALLEL > 1) {
     log(`并发模式: ${PARALLEL} 片同时写（每片独立 session）。注意抖音风控，建议 ≤3。`);
-    await runParallel(slices, state, PARALLEL);
+    try {
+      await runParallel(slices, state, PARALLEL);
+    } catch (err) {
+      if (err instanceof LoginInvalidError) {
+        log("🔴 因登录态失效已中断（并发模式）。重新登录抖音后重跑本脚本即可从断点续跑。");
+        return;
+      }
+      throw err;
+    }
   } else {
-    for (let i = 0; i < slices.length; i++) {
-      await processSlice(i, slices[i], state);
+    try {
+      for (let i = 0; i < slices.length; i++) {
+        await processSlice(i, slices[i], state);
+      }
+    } catch (err) {
+      if (err instanceof LoginInvalidError) {
+        log("🔴 因抖音登录态失效已中断全量写入。重新登录抖音后重跑本脚本（--no-collect）即可从断点续跑：已 done 片自动跳过，当前 error/未标记片会重试。");
+        return;
+      }
+      throw err;
     }
   }
 
