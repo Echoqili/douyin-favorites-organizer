@@ -2,6 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDirectory, readJson, sha256, writeJson } from "./io.mjs";
 
+const COMMITTED_STATUSES = new Set(["verified", "unavailable"]);
+const RETRYABLE_STATUSES = new Set(["deferred", "failed"]);
+
 function readJsonIfExists(file) {
   return fs.existsSync(file) ? readJson(file) : null;
 }
@@ -12,6 +15,14 @@ function readJournal(file) {
     .split(/\r?\n/u)
     .filter(Boolean)
     .map(line => JSON.parse(line));
+}
+
+function latestJournalStatus(entries) {
+  const latestStatus = new Map();
+  for (const entry of entries) {
+    for (const id of entry.aweme_ids || []) latestStatus.set(String(id), String(entry.status || ""));
+  }
+  return latestStatus;
 }
 
 function emptyState() {
@@ -43,23 +54,24 @@ function applyRunToState(state, runDirectory) {
   if (!source?.favorites) return state;
   const plan = readJsonIfExists(path.join(runDirectory, "classification-plan.json"));
   const assignments = new Map((plan?.assignments || []).map(item => [String(item.aweme_id), item]));
-  const latestStatus = new Map();
-  for (const entry of readJournal(path.join(runDirectory, "apply-journal.jsonl"))) {
-    for (const id of entry.aweme_ids || []) latestStatus.set(String(id), entry.status);
-  }
+  const journalEntries = readJournal(path.join(runDirectory, "apply-journal.jsonl"));
+  const latestStatus = latestJournalStatus(journalEntries);
   for (const folder of plan?.folders || []) mergeFolder(state, folder);
   for (const folderName of plan?.existing_folders || []) mergeFolder(state, folderName);
   for (const favorite of source.favorites) {
     const id = String(favorite.aweme_id);
     const assignment = assignments.get(id);
-    const previous = state.videos[id] || {};
+    const previous = state.videos[id];
+    const status = latestStatus.get(id);
+    const legacyCompleted = journalEntries.length === 0 && Boolean(assignment);
+    if (!previous && !COMMITTED_STATUSES.has(status) && !legacyCompleted) continue;
     state.videos[id] = {
       aweme_id: id,
-      first_seen_at: previous.first_seen_at || source.captured_at || null,
-      last_seen_at: source.captured_at || previous.last_seen_at || null,
+      first_seen_at: previous?.first_seen_at || source.captured_at || null,
+      last_seen_at: source.captured_at || previous?.last_seen_at || null,
       title_sha256: sha256(String(favorite.title || "")),
-      folder: assignment?.folder || previous.folder || null,
-      status: latestStatus.get(id) || previous.status || "seen",
+      folder: assignment?.folder || previous?.folder || null,
+      status: COMMITTED_STATUSES.has(status) ? status : (previous?.status || "seen"),
     };
   }
   return state;
@@ -79,9 +91,16 @@ export function buildHistoricalState(runsRoot, { excludeRun } = {}) {
   return state;
 }
 
+function assertCompleteSource(source) {
+  if (source.coverage_warning === true || source.coverage?.complete === false) {
+    throw new Error("Cannot prepare incremental work from an incomplete favorites capture");
+  }
+}
+
 export function prepareIncrementalRun(runDirectory, { stateFile } = {}) {
   const run = path.resolve(runDirectory);
   const source = readJson(path.join(run, "favorites.json"));
+  assertCompleteSource(source);
   const resolvedStateFile = path.resolve(stateFile || path.join(path.dirname(path.dirname(run)), "state", "organizer-state.json"));
   const state = fs.existsSync(resolvedStateFile)
     ? readJson(resolvedStateFile)
@@ -133,6 +152,7 @@ export function commitIncrementalRun(runDirectory, { stateFile } = {}) {
   const run = path.resolve(runDirectory);
   const summary = readJson(path.join(run, "incremental-summary.json"));
   const source = readJson(path.join(run, "favorites.json"));
+  assertCompleteSource(source);
   const incrementalSource = readJson(path.join(run, "incremental-favorites.json"));
   const resolvedStateFile = path.resolve(stateFile || summary.state_file);
   const state = fs.existsSync(resolvedStateFile)
@@ -142,33 +162,47 @@ export function commitIncrementalRun(runDirectory, { stateFile } = {}) {
     ? readJson(path.join(run, "classification-plan.json"))
     : { assignments: [], folders: [], existing_folders: [] };
   const assignments = new Map((plan.assignments || []).map(item => [String(item.aweme_id), item]));
-  const latestStatus = new Map();
-  for (const entry of readJournal(path.join(run, "apply-journal.jsonl"))) {
-    for (const id of entry.aweme_ids || []) latestStatus.set(String(id), entry.status);
-  }
+  const latestStatus = latestJournalStatus(readJournal(path.join(run, "apply-journal.jsonl")));
+  const unknown = [];
   const incomplete = [];
+  const committedIds = new Set();
+  const deferredIds = [];
   for (const favorite of incrementalSource.favorites) {
     const id = String(favorite.aweme_id);
     const status = latestStatus.get(id);
-    if (!assignments.has(id) || !["verified", "unavailable"].includes(status)) incomplete.push(id);
+    if (!assignments.has(id)) {
+      incomplete.push(id);
+    } else if (status === "unknown") {
+      unknown.push(id);
+    } else if (COMMITTED_STATUSES.has(status)) {
+      committedIds.add(id);
+    } else if (RETRYABLE_STATUSES.has(status)) {
+      deferredIds.push(id);
+    } else {
+      incomplete.push(id);
+    }
+  }
+  if (unknown.length) {
+    throw new Error(`Cannot commit incremental state; unknown submit result for aweme_id values: ${unknown.join(",")}`);
   }
   if (incomplete.length) {
     throw new Error(`Cannot commit incremental state; incomplete aweme_id values: ${incomplete.join(",")}`);
   }
   for (const folder of plan.folders || []) mergeFolder(state, folder);
   for (const folderName of plan.existing_folders || []) mergeFolder(state, folderName);
-  const assignmentById = new Map((plan.assignments || []).map(item => [String(item.aweme_id), item]));
+  const incrementalIds = new Set(incrementalSource.favorites.map(item => String(item.aweme_id)));
   for (const favorite of source.favorites) {
     const id = String(favorite.aweme_id);
-    const previous = state.videos[id] || {};
-    const assignment = assignmentById.get(id);
+    const previous = state.videos[id];
+    if (incrementalIds.has(id) && !committedIds.has(id)) continue;
+    const assignment = assignments.get(id);
     state.videos[id] = {
       aweme_id: id,
-      first_seen_at: previous.first_seen_at || source.captured_at || null,
-      last_seen_at: source.captured_at || previous.last_seen_at || null,
+      first_seen_at: previous?.first_seen_at || source.captured_at || null,
+      last_seen_at: source.captured_at || previous?.last_seen_at || null,
       title_sha256: sha256(String(favorite.title || "")),
-      folder: assignment?.folder || previous.folder || null,
-      status: latestStatus.get(id) || previous.status || "seen",
+      folder: assignment?.folder || previous?.folder || null,
+      status: committedIds.has(id) ? latestStatus.get(id) : (previous?.status || "seen"),
     };
   }
   state.updated_at = new Date().toISOString();
@@ -177,8 +211,15 @@ export function commitIncrementalRun(runDirectory, { stateFile } = {}) {
     captured_at: source.captured_at,
     full_count: source.favorites.length,
     new_count: incrementalSource.favorites.length,
+    committed_count: committedIds.size,
+    deferred_count: deferredIds.length,
   };
   ensureDirectory(path.dirname(resolvedStateFile));
   writeJson(resolvedStateFile, state);
-  return { stateFile: resolvedStateFile, state, committed: incrementalSource.favorites.length };
+  return {
+    stateFile: resolvedStateFile,
+    state,
+    committed: committedIds.size,
+    deferred: deferredIds,
+  };
 }

@@ -35,6 +35,17 @@ function commandIsAvailable() {
   return result.status === 0 && hasDouyinSavedCommand(`${result.stdout}\n${result.stderr}`);
 }
 
+export function hasFullCollectionCapability(output) {
+  const text = String(output || "");
+  return /Number of saved videos to return \(1-5000\)/u.test(text)
+    && /default:\s*5000/u.test(text);
+}
+
+function commandIsCompatible() {
+  const result = runOpencli(["douyin", "saved", "--help"]);
+  return result.status === 0 && hasFullCollectionCapability(`${result.stdout}\n${result.stderr}`);
+}
+
 function resultMessage(result) {
   return String(result.stderr || result.stdout || `exit code ${result.status}`).trim();
 }
@@ -47,7 +58,15 @@ export function setupOpencliPlugin() {
     throw new Error("The bundled douyin-saved plugin is missing. Download the complete repository again.");
   }
   if (commandIsAvailable()) {
-    return { installed: false, message: "OpenCLI command `douyin saved` is already available." };
+    if (commandIsCompatible()) {
+      return { installed: false, message: "OpenCLI command `douyin saved` is already available and supports complete captures up to 5000 items." };
+    }
+    const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const pluginPath = path.join(home, ".opencli", "plugins", "douyin-saved");
+    throw new Error(
+      "OpenCLI command `douyin saved` exists but does not support complete captures above 200 items. "
+      + `Update the existing plugin at ${pluginPath}; setup will not overwrite an occupied plugin.`,
+    );
   }
 
   const result = runOpencli(["plugin", "install", pathToFileURL(BUNDLED_PLUGIN).href]);
@@ -62,7 +81,10 @@ export function setupOpencliPlugin() {
   if (!commandIsAvailable()) {
     throw new Error("The plugin installer completed, but `opencli douyin saved` is still unavailable.");
   }
-  return { installed: true, message: "Installed and verified OpenCLI command `douyin saved`." };
+  if (!commandIsCompatible()) {
+    throw new Error("The plugin installer completed, but `opencli douyin saved` does not expose the required 5000-item complete-capture capability.");
+  }
+  return { installed: true, message: "Installed and verified OpenCLI command `douyin saved` with complete-capture support up to 5000 items." };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

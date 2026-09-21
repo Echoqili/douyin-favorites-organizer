@@ -36,6 +36,7 @@ test("applies multiple folder batches after one saved-video scan", async () => {
     ok: true,
     scan_passes: 1,
     mapped_videos: 3,
+    deferred_videos: 0,
     unavailable_videos: 0,
     results: [
       { folder: "AI工具", status: "verified", videos: 2, baseline_count: 10, final_count: 12 },
@@ -113,8 +114,8 @@ test("stops before the next folder when the writer page is no longer clean", asy
   });
 });
 
-test("records missing videos once and still applies the available videos", async () => {
-  const unavailable = [];
+test("defers videos missing from a bounded scan and still applies available videos", async () => {
+  const deferred = [];
   const submittedSelections = [];
   let selected = [];
   let count = 4;
@@ -137,18 +138,19 @@ test("records missing videos once and still applies the available videos", async
       verifyWriterReady: async () => ({ ready: selected.length === 0 }),
       verifyFolderCount: async (_folder, expected) => count === expected,
     },
-    recordUnavailable: (folder, ids) => { unavailable.push({ folder, ids }); },
+    recordDeferred: (folder, ids) => { deferred.push({ folder, ids }); },
     journal: () => {},
   });
 
-  assert.deepEqual({ unavailable, submittedSelections, summary: result }, {
-    unavailable: [{ folder: "混合批次", ids: ["100000000000031"] }],
+  assert.deepEqual({ deferred, submittedSelections, summary: result }, {
+    deferred: [{ folder: "混合批次", ids: ["100000000000031"] }],
     submittedSelections: [["100000000000032"]],
     summary: {
       ok: true,
       scan_passes: 1,
       mapped_videos: 1,
-      unavailable_videos: 1,
+      deferred_videos: 1,
+      unavailable_videos: 0,
       results: [
         { folder: "混合批次", status: "verified", videos: 1, baseline_count: 4, final_count: 5 },
       ],

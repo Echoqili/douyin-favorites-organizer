@@ -42,10 +42,10 @@ async function main() {
   const args = parseArgs(rest);
   if (command === "collect") {
     const result = await collectFavorites({
-      limit: args.limit ? Number(args.limit) : 200,
+      limit: args.limit ? Number(args.limit) : undefined,
       outputDirectory: args.out ? path.resolve(args.out) : undefined,
     });
-    process.stdout.write(`${JSON.stringify({ ok: true, run: result.directory, count: result.source.count, coverage_warning: result.source.coverage_warning }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: true, run: result.directory, count: result.source.count, coverage_warning: result.source.coverage_warning, coverage: result.source.coverage }, null, 2)}\n`);
     return;
   }
   if (command === "draft") {

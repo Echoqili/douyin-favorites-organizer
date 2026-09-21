@@ -7,7 +7,7 @@ export async function applyAllFolderBatches({
   browser,
   journal,
   isBatchVerified = () => false,
-  recordUnavailable = () => {},
+  recordDeferred = () => {},
 }) {
   const folderNames = batches.map(batch => String(batch.folder));
   const baselines = await browser.readFolderCounts(folderNames);
@@ -33,23 +33,23 @@ export async function applyAllFolderBatches({
       });
       continue;
     }
-    const unavailableIds = ids.filter(id => missing.has(id));
+    const deferredIds = ids.filter(id => missing.has(id));
     const availableIds = ids.filter(id => !missing.has(id));
 
-    if (unavailableIds.length) {
-      recordUnavailable(folder, unavailableIds);
+    if (deferredIds.length) {
+      recordDeferred(folder, deferredIds);
       journal({
         folder,
-        ids: unavailableIds,
-        status: "unavailable",
+        ids: deferredIds,
+        status: "deferred",
         verifiedCount: 0,
-        evidence: "not rendered in Douyin batch management UI after one shared bounded scan",
+        evidence: "not found during one shared bounded browser scan; retry on the next run",
       });
     }
     if (!availableIds.length) {
       results.push({
         folder,
-        status: "unavailable",
+        status: "deferred",
         videos: 0,
         baseline_count: baselineCount,
         final_count: baselineCount,
@@ -117,7 +117,8 @@ export async function applyAllFolderBatches({
     ok: true,
     scan_passes: allIds.length ? 1 : 0,
     mapped_videos: Number(availability.mapped || availability.available?.length || 0),
-    unavailable_videos: missing.size,
+    deferred_videos: missing.size,
+    unavailable_videos: 0,
     results,
   };
 }

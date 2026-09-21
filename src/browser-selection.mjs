@@ -1,3 +1,16 @@
+export function mergeObservedMappedIds(observedIds, mappedRows) {
+  const observed = new Set((observedIds || []).map(String));
+  for (const row of mappedRows || []) {
+    const id = String(row?.id || "");
+    if (id) observed.add(id);
+  }
+  return [...observed];
+}
+
+export function mappedIdSignature(ids) {
+  return [...new Set((ids || []).map(String).filter(Boolean))].sort().join("|");
+}
+
 export function partitionMappedTargets(targetIds, mappedIds) {
   const mapped = new Set([...mappedIds].map(String));
   const normalized = targetIds.map(String);

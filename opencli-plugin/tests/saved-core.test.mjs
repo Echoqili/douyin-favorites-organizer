@@ -7,15 +7,20 @@ import {
   mergeCapturedSavedPages,
   normalizeLimit,
   pageSizeFor,
+  savedCaptureCoverage,
 } from "../lib/saved-core.mjs";
 
 test("normalizes limits and page sizes", () => {
-  assert.equal(normalizeLimit(undefined), 20);
+  assert.equal(normalizeLimit(undefined), 5000);
   assert.equal(normalizeLimit(200), 200);
+  assert.equal(normalizeLimit(201), 201);
+  assert.equal(normalizeLimit(216), 216);
+  assert.equal(normalizeLimit(500), 500);
+  assert.equal(normalizeLimit(5000), 5000);
   assert.equal(pageSizeFor(50), 18);
   assert.equal(pageSizeFor(4), 4);
-  assert.throws(() => normalizeLimit(0), /between 1 and 200/u);
-  assert.throws(() => normalizeLimit(201), /between 1 and 200/u);
+  assert.throws(() => normalizeLimit(0), /between 1 and 5000/u);
+  assert.throws(() => normalizeLimit(5001), /between 1 and 5000/u);
 });
 
 test("extracts the logged-in self user only from the expected render path", () => {
@@ -55,4 +60,36 @@ test("merges only saved-video collection responses across pages", () => {
     { endpoint: "/aweme/v1/web/collects/video/list/", items: [{ aweme_id: "104" }] },
   ];
   assert.deepEqual(mergeCapturedSavedPages(pages, 10).map(item => item.aweme_id), ["101", "102", "103", "104"]);
+});
+
+test("does not truncate a captured collection above 200 items", () => {
+  const pages = Array.from({ length: 12 }, (_, pageIndex) => ({
+    endpoint: "/aweme/v1/web/aweme/listcollection/",
+    has_more: pageIndex < 11,
+    cursor: pageIndex + 1,
+    items: Array.from({ length: 18 }, (_, itemIndex) => ({
+      aweme_id: String(pageIndex * 18 + itemIndex + 1),
+    })),
+  }));
+  assert.equal(mergeCapturedSavedPages(pages, 5000).length, 216);
+});
+
+test("marks capture complete only with terminal pagination evidence and full DOM coverage", () => {
+  const pages = [
+    { endpoint: "/aweme/v1/web/aweme/listcollection/", has_more: true, cursor: 18, items: [{ aweme_id: "101" }] },
+    { endpoint: "/aweme/v1/web/aweme/listcollection/", has_more: false, cursor: 19, items: [{ aweme_id: "102" }] },
+  ];
+  assert.deepEqual(savedCaptureCoverage({ pages, errors: [], pending: 0, domIds: ["101", "102"] }, 5000), {
+    complete: true,
+    reason: "source_exhausted",
+    count: 2,
+    missing_dom_ids: [],
+    capture_errors: 0,
+    pending: 0,
+    source_exhausted: true,
+    budget_exhausted: false,
+  });
+  assert.equal(savedCaptureCoverage({ pages: [pages[0]], errors: [], pending: 0, domIds: ["101"] }, 5000).reason, "pagination_not_exhausted");
+  assert.equal(savedCaptureCoverage({ pages: [pages[1]], errors: [], pending: 0, domIds: ["101", "102"] }, 5000).reason, "visible_items_missing");
+  assert.equal(savedCaptureCoverage({ pages: [pages[1]], errors: [{}], pending: 0, domIds: ["102"] }, 5000).reason, "capture_errors");
 });

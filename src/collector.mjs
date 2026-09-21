@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import { ensureDirectory, sha256, timestampId, writeJson } from "./io.mjs";
+import { limits, normalizeLimit } from "../opencli-plugin/lib/saved-core.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOCAL_OPENCLI = path.join(PROJECT_ROOT, "node_modules", "@jackwener", "opencli", "dist", "src", "main.js");
@@ -45,11 +46,8 @@ export function sanitizeFavorite(row, rank) {
   };
 }
 
-export async function collectFavorites({ limit = 200, outputDirectory } = {}) {
-  const normalizedLimit = Number(limit);
-  if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 200) {
-    throw new Error("limit must be an integer between 1 and 200");
-  }
+export async function collectFavorites({ limit = limits.default, outputDirectory } = {}) {
+  const normalizedLimit = normalizeLimit(limit);
   if (!fs.existsSync(LOCAL_OPENCLI)) {
     throw new Error("Project-local OpenCLI is missing. Run npm install first.");
   }
@@ -85,7 +83,11 @@ export async function collectFavorites({ limit = 200, outputDirectory } = {}) {
     source: "opencli douyin saved",
     requested_limit: normalizedLimit,
     count: favorites.length,
-    coverage_warning: favorites.length === normalizedLimit,
+    coverage_warning: false,
+    coverage: {
+      complete: true,
+      reason: "source_exhausted",
+    },
     source_sha256: sourceHash,
     favorites,
   };

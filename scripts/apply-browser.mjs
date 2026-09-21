@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { appendJournal } from "../src/journal.mjs";
 import { applyAllFolderBatches } from "../src/apply-all.mjs";
 import { browserSessionPolicy, douyinFavoritesUrl } from "../src/browser-session-policy.mjs";
-import { partitionMappedTargets, targetCheckboxSelector } from "../src/browser-selection.mjs";
+import { mergeObservedMappedIds, mappedIdSignature, partitionMappedTargets, targetCheckboxSelector } from "../src/browser-selection.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const OPENCLI = path.join(ROOT, "node_modules", "@jackwener", "opencli", "dist", "src", "main.js");
@@ -291,41 +291,72 @@ async function enterManagement() {
   if (!controls.exit || !controls.add || !controls.cancel) throw new Error(`Management controls changed: ${JSON.stringify(controls)}`);
 }
 
+async function scrollManagementForward() {
+  await evaluate(`(() => {
+    const boxes = [...document.querySelectorAll('input[type=checkbox]')];
+    const last = boxes.at(-1)?.parentElement?.parentElement?.parentElement;
+    last?.scrollIntoView({ block: 'end', inline: 'nearest' });
+    const scrollers = [...document.querySelectorAll('*')].filter(element => {
+      if (element.scrollHeight <= element.clientHeight + 100 || element.clientHeight < 200) return false;
+      const overflow = getComputedStyle(element).overflowY;
+      return overflow === 'auto' || overflow === 'scroll';
+    });
+    for (const scroller of scrollers) {
+      scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(500, Math.floor(scroller.clientHeight * 0.85)));
+    }
+    return { boxes: boxes.length, scrollers: scrollers.length };
+  })()`);
+}
+
+async function rewindManagementList() {
+  await evaluate(`(() => {
+    window.scrollTo(0, 0);
+    document.scrollingElement?.scrollTo(0, 0);
+    const scrollers = [...document.querySelectorAll('*')].filter(element => {
+      if (element.scrollHeight <= element.clientHeight + 100 || element.clientHeight < 200) return false;
+      const overflow = getComputedStyle(element).overflowY;
+      return overflow === 'auto' || overflow === 'scroll';
+    });
+    for (const scroller of scrollers) scroller.scrollTop = 0;
+    document.querySelector('input[type=checkbox]')?.scrollIntoView({ block: 'start', inline: 'nearest' });
+    return scrollers.length;
+  })()`);
+  await wait(0.45);
+}
+
 async function loadTargetIds(targetIds) {
   let stable = 0;
-  let previous = -1;
+  let previousSignature = "";
+  let observedIds = [];
+  let attempts = 0;
   for (let attempt = 0; attempt < 50; attempt += 1) {
+    attempts = attempt + 1;
     const mapped = await evaluate(mappingExpression);
-    const ids = new Set(mapped.map(item => item.id));
+    observedIds = mergeObservedMappedIds(observedIds, mapped);
+    const ids = new Set(observedIds);
     if (targetIds.every(id => ids.has(id))) {
-      return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: attempt + 1 };
+      return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts };
     }
-    if (ids.size === previous) stable += 1;
+    const signature = mappedIdSignature(observedIds);
+    if (signature === previousSignature) stable += 1;
     else stable = 0;
-    previous = ids.size;
+    previousSignature = signature;
     if (stable >= 7) break;
-    await evaluate(`(() => {
-      const boxes = [...document.querySelectorAll('input[type=checkbox]')];
-      const last = boxes.at(-1)?.parentElement?.parentElement?.parentElement;
-      last?.scrollIntoView({ block: 'end', inline: 'nearest' });
-      const scrollers = [...document.querySelectorAll('*')].filter(element => {
-        if (element.scrollHeight <= element.clientHeight + 100 || element.clientHeight < 200) return false;
-        const overflow = getComputedStyle(element).overflowY;
-        return overflow === 'auto' || overflow === 'scroll';
-      });
-      for (const scroller of scrollers) {
-        scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(500, Math.floor(scroller.clientHeight * 0.85)));
-      }
-      return { boxes: boxes.length, scrollers: scrollers.length };
-    })()`);
+    await scrollManagementForward();
     await wait(0.45);
   }
   const final = await evaluate(mappingExpression);
-  const ids = new Set(final.map(item => item.id));
-  return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts: 50 };
+  observedIds = mergeObservedMappedIds(observedIds, final);
+  const ids = new Set(observedIds);
+  return { ...partitionMappedTargets(targetIds, ids), mapped: ids.size, attempts };
 }
 
 async function selectTargetIds(targetIds) {
+  const current = new Set((await evaluate(mappingExpression)).map(item => String(item.id)));
+  if (!targetIds.every(id => current.has(String(id)))) {
+    await rewindManagementList();
+    await loadTargetIds(targetIds);
+  }
   const marked = await evaluate(`(() => {
     const targets = new Set(${JSON.stringify(targetIds)});
     const pattern = new RegExp('video/(\\\\d{15,})', 'g');
@@ -454,9 +485,9 @@ function exactBatchVerified(runDirectory, folder, ids) {
     });
 }
 
-function recordUnavailableIds(runDirectory, folder, ids) {
+function recordDeferredIds(runDirectory, folder, ids) {
   if (!ids.length) return;
-  const file = path.join(runDirectory, "unavailable-video-ids.json");
+  const file = path.join(runDirectory, "deferred-video-ids.json");
   const document = fs.existsSync(file)
     ? JSON.parse(fs.readFileSync(file, "utf8"))
     : { schema_version: 1, entries: [] };
@@ -465,7 +496,7 @@ function recordUnavailableIds(runDirectory, folder, ids) {
     entries.set(String(id), {
       aweme_id: String(id),
       folder,
-      reason: "not rendered in Douyin batch management UI after full bounded scroll",
+      reason: "not found during a bounded Douyin batch-management scan; retry on the next run",
     });
   }
   fs.writeFileSync(file, `${JSON.stringify({ schema_version: 1, entries: [...entries.values()] }, null, 2)}\n`, "utf8");
@@ -488,13 +519,13 @@ async function addFolderBatch(folder, videos, runDirectory) {
     const availability = await loadTargetIds(ids);
     attemptedIds = availability.available;
     if (availability.missing.length) {
-      recordUnavailableIds(runDirectory, folder, availability.missing);
+      recordDeferredIds(runDirectory, folder, availability.missing);
       appendJournal(runDirectory, {
         folder,
         ids: availability.missing,
-        status: "unavailable",
+        status: "deferred",
         verifiedCount: 0,
-        evidence: "not rendered in Douyin batch management UI after full bounded scroll",
+        evidence: "not found during a bounded browser scan; retry on the next run",
       });
     }
     if (!attemptedIds.length) {
@@ -502,10 +533,10 @@ async function addFolderBatch(folder, videos, runDirectory) {
       await wait(0.5);
       return {
         folder,
-        status: "unavailable",
+        status: "deferred",
         videos: 0,
         verifiedCount: 0,
-        unavailable: availability.missing.length,
+        deferred: availability.missing.length,
         baselineCount: beforeCount,
         finalCount: beforeCount,
       };
@@ -532,7 +563,7 @@ async function addFolderBatch(folder, videos, runDirectory) {
           status: "verified",
           videos: attemptedIds.length,
           verifiedCount: attemptedIds.length,
-          unavailable: availability.missing.length,
+          deferred: availability.missing.length,
           baselineCount: beforeCount,
           finalCount: afterCount,
         };
@@ -598,7 +629,7 @@ async function applyAllBatches(manifest, runDirectory) {
         verifyFolderCount: (folder, expectedCount) => verifyFolderCountInTab(verifierTab, folder, expectedCount),
       },
       journal: entry => appendJournal(runDirectory, entry),
-      recordUnavailable: (folder, ids) => recordUnavailableIds(runDirectory, folder, ids),
+      recordDeferred: (folder, ids) => recordDeferredIds(runDirectory, folder, ids),
       isBatchVerified: batch => exactBatchVerified(
         runDirectory,
         batch.folder,
@@ -655,39 +686,11 @@ async function main() {
     return;
   }
   if (command === "apply-all") {
-    const unavailableFile = path.join(runDirectory, "unavailable-video-ids.json");
-    const unavailableDocument = fs.existsSync(unavailableFile)
-      ? JSON.parse(fs.readFileSync(unavailableFile, "utf8"))
-      : { entries: [] };
-    const knownUnavailable = new Set((unavailableDocument.entries || []).map(entry => String(entry.aweme_id)));
-    const skipped = manifest.add_to_folders.flatMap(batch => batch.videos
-      .filter(video => knownUnavailable.has(String(video.aweme_id)))
-      .map(video => ({ folder: batch.folder, video })));
-    for (const item of skipped) {
-      appendJournal(runDirectory, {
-        folder: item.folder,
-        ids: [item.video.aweme_id],
-        status: "unavailable",
-        verifiedCount: 0,
-        evidence: "not rendered in Douyin batch management UI after one shared bounded scan",
-      });
-    }
-    const preparedManifest = {
-      ...manifest,
-      add_to_folders: manifest.add_to_folders
-        .map(batch => ({
-          ...batch,
-          videos: batch.videos.filter(video => !knownUnavailable.has(String(video.aweme_id))),
-        }))
-        .filter(batch => batch.videos.length > 0),
-    };
-    const result = preparedManifest.add_to_folders.length
-      ? await applyAllBatches(preparedManifest, runDirectory)
-      : { ok: true, scan_passes: 0, mapped_videos: 0, unavailable_videos: 0, results: [] };
+    const result = manifest.add_to_folders.length
+      ? await applyAllBatches(manifest, runDirectory)
+      : { ok: true, scan_passes: 0, mapped_videos: 0, deferred_videos: 0, unavailable_videos: 0, results: [] };
     process.stdout.write(`${JSON.stringify({
       ...result,
-      unavailable_videos: result.unavailable_videos + skipped.length,
-      previously_unavailable: skipped.length,
       planned: manifest.add_to_folders.reduce((sum, batch) => sum + batch.videos.length, 0),
     }, null, 2)}\n`);
     return;
@@ -696,26 +699,8 @@ async function main() {
     if (!args.folder) throw new Error("--folder is required");
     const batch = manifest.add_to_folders.find(item => item.folder === args.folder);
     if (!batch) throw new Error(`Folder batch is not in the manifest: ${args.folder}`);
-    const unavailableFile = path.join(runDirectory, "unavailable-video-ids.json");
-    const unavailableDocument = fs.existsSync(unavailableFile)
-      ? JSON.parse(fs.readFileSync(unavailableFile, "utf8"))
-      : { entries: [] };
-    const unavailable = new Set((unavailableDocument.entries || []).map(entry => String(entry.aweme_id)));
-    const skipped = batch.videos.filter(video => unavailable.has(String(video.aweme_id)));
-    const available = batch.videos.filter(video => !unavailable.has(String(video.aweme_id)));
-    if (skipped.length) {
-      appendJournal(runDirectory, {
-        folder: batch.folder,
-        ids: skipped.map(video => video.aweme_id),
-        status: "unavailable",
-        verifiedCount: 0,
-        evidence: "not rendered in Douyin batch management UI after full scroll and search",
-      });
-    }
-    const result = available.length
-      ? await addFolderBatch(batch.folder, available, runDirectory)
-      : { folder: batch.folder, status: "unavailable", videos: 0, verifiedCount: 0 };
-    process.stdout.write(`${JSON.stringify({ ok: true, result, unavailable: skipped.length, planned: batch.videos.length }, null, 2)}\n`);
+    const result = await addFolderBatch(batch.folder, batch.videos, runDirectory);
+    process.stdout.write(`${JSON.stringify({ ok: true, result, planned: batch.videos.length }, null, 2)}\n`);
     return;
   }
   throw new Error("Use inspect-folders, preflight, create-folders, apply-all, add-folder, or close");
