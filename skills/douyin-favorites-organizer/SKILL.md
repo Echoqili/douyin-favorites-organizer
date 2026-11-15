@@ -23,7 +23,7 @@ Do not continue when setup reports a conflicting plugin source. Inspect the repo
 - Never click or invoke `取消收藏`. Folder assignment must not remove the original favorite.
 - Never delete, rename, merge, or hide an existing folder automatically.
 - Stop on login loss, CAPTCHA, changed selectors, ambiguous video IDs, unknown submit results, or count mismatches.
-- Treat the 200-item collection ceiling as incomplete coverage unless explicitly acknowledged.
+- Treat hitting the collection limit as incomplete coverage unless explicitly acknowledged.
 
 ## Choose the authorization mode
 
@@ -47,7 +47,7 @@ Any action outside this scope requires fresh user approval.
 
 ## One-time workflow
 
-1. Run `npm run collect -- --limit 200` and record `RUN_DIR`.
+1. Run `npm run collect` (defaults to a full pull, limit 12000) and record `RUN_DIR`.
 2. Run `npm run draft -- --run <RUN_DIR>`.
 3. Refine the plan using [references/classification-policy.md](references/classification-policy.md).
 4. Run `npm run validate -- --run <RUN_DIR>` and `npm run preview -- --run <RUN_DIR>`.
@@ -58,7 +58,7 @@ Any action outside this scope requires fresh user approval.
 
 1. Confirm `git status -sb` has no unexpected code changes. Runtime files under ignored `var/` are allowed.
 2. Run `npm run browser-apply -- inspect-folders` and record the current folder names, counts, and visibility.
-3. Run `npm run collect -- --limit 200` and record `RUN_DIR`.
+3. Run `npm run collect` (defaults to a full pull, limit 12000) and record `RUN_DIR`.
 4. Run `npm run incremental -- --run <RUN_DIR>`.
 5. Read `incremental-summary.json`:
    - If `new_count` is `0`, make no account changes and stop quietly.
