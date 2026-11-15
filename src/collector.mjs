@@ -11,6 +11,17 @@ export function hasDouyinSavedCommand(output) {
   return /^\s{2}saved(?:\s|\[)/mu.test(String(output || ""));
 }
 
+export function cleanOpencliError(stdout, stderr) {
+  const lines = `${stdout}\n${stderr}`
+    .split(/\r?\n/u)
+    .filter(line => !/UNDICI|EnvHttpProxyAgent|trace-warnings/u.test(line.trim()));
+  const cleaned = lines.join("\n").trim();
+  if (/AUTH_REQUIRED/u.test(cleaned)) {
+    return "抖音登录态缺失：请确认 Chrome/Chromium 已打开并登录 https://www.douyin.com，且浏览器桥（opencli browser）处于运行状态后重试。";
+  }
+  return cleaned || "OpenCLI 执行失败，且无更多错误信息。";
+}
+
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -28,7 +39,7 @@ function run(command, args, options = {}) {
     child.on("error", reject);
     child.on("close", code => {
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`OpenCLI exited ${code}: ${stderr.trim() || stdout.trim()}`));
+      else reject(new Error(cleanOpencliError(stdout, stderr)));
     });
   });
 }
