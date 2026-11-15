@@ -6,6 +6,7 @@
   "scripts": {
     "setup": "node scripts/setup-opencli-plugin.mjs",
     "setup:opencli": "node scripts/setup-opencli-plugin.mjs",
+    "check": "node scripts/check.mjs",
     "collect": "node src/cli.mjs collect",
     "incremental": "node src/cli.mjs incremental",
     "draft": "node src/cli.mjs draft",

@@ -2,3 +2,5 @@ node_modules/
 var/
 *.log
 .skill-init/
+scripts/archive/
+.workbuddy/

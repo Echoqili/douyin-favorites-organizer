@@ -29,7 +29,7 @@
 
 - 需要在手机端后台独立运行；
 - 希望绕过登录、验证码或抖音页面限制；
-- 收藏数量超过 200 条且要求项目证明完整覆盖；
+- 收藏数量超过采集上限（默认 12000 条）且要求项目证明完整覆盖；
 - 希望自动重命名、合并、拆分或删除历史收藏夹。
 
 ## 工作流程
@@ -95,6 +95,16 @@ npm run security-scan
 `npm install` 只安装 OpenCLI 主程序；官方 `@jackwener/opencli@1.8.6` 本身没有 `douyin saved` 命令。
 `npm run setup` 会把仓库内置的只读插件注册到当前用户的 OpenCLI，并立即确认该命令可用。该步骤可重复执行；如果同名插件已存在但来源不同，安装程序会停止并提示检查，不会擅自覆盖。
 
+### 最简单的一键只读检查
+
+环境就绪后，一条命令完成「采集 → 增量比对 → 分类初稿 → 校验 → 预览」，全程不修改抖音账号：
+
+```powershell
+npm run check
+```
+
+它会打印可读的进度与结果，并在最后给出运行目录和下一步（预览文件 `preview.md`、分类计划 `classification-plan.json` 的路径）。收藏数较多时可用 `npm run check -- --limit 3000` 拉全量。
+
 推荐让 Codex 从仓库根目录读取：
 
 ```text
@@ -120,7 +130,8 @@ npm run browser-apply -- inspect-folders
 采集收藏并生成本地运行目录（首次使用前必须已成功执行 `npm run setup`）：
 
 ```powershell
-npm run collect -- --limit 200
+npm run collect            # 默认拉取全量（上限 12000）
+npm run collect -- --limit 200   # 或指定条数
 ```
 
 命令会返回一个 `RUN_DIR`。后续增量准备：
@@ -209,10 +220,12 @@ npm run commit-state -- --run <RUN_DIR>
 
 这一轮整理踩过的坑、验证过的结论、以及为什么最终只做到 70% 自动化，单独记在 [`经验技巧.md`](经验技巧.md)。包括：抖音批量管理复选框忽略一切合成事件（必须用 opencli 真实 CDP）、勾选态跨虚拟化持久、三条写入路径全部证伪、真实夹大小小于角标、分类计划"300 而非 6189"等。新接手或想重跑读取管线前建议先读。
 
+> 项目里的 `scripts/` 目录只保留**入口与可复用脚本**（`check.mjs` 一键只读检查、`apply-browser.mjs` 浏览器写入、`classify-*.mjs` 分类、`security-scan.mjs` 安全扫描等）。历史上为排查问题留下的临时 `debug-*` / `diag*` / `probe-*` 脚本已归档到 `scripts/archive/`（该目录被 gitignore，不入库）。
+
 ## 当前限制
 
 - 抖音页面结构变化可能使浏览器适配器暂时失效。
-- 采集上限为 200 条；达到上限时不能宣称完整覆盖全部收藏。
+- 采集上限默认 12000 条（可用 `--limit` 调小）；达到上限时不能宣称完整覆盖全部收藏。
 - 分类主要依赖当前可获得的标题、作者、标签、转录或画面证据；证据不足时必须降级为 `待确认`。
 - “创建新的公开收藏夹”的最新增量路径已通过代码、计划与只读界面验证，但尚未在更新后的版本中用一个全新真实分类完成完整端到端写入复验。
 - 定时运行依赖电脑、Codex、浏览器桥和抖音登录状态在执行时可用。
@@ -221,6 +234,7 @@ npm run commit-state -- --run <RUN_DIR>
 
 ```powershell
 npm test
+npm run check          # 一键只读检查（采集 → 增量 → 分类 → 校验 → 预览）
 npm run setup
 npm run security-scan
 npm audit --registry=https://registry.npmjs.org --audit-level=high
