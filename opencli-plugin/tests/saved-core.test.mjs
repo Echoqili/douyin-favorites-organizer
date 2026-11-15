@@ -14,8 +14,8 @@ test("normalizes limits and page sizes", () => {
   assert.equal(normalizeLimit(200), 200);
   assert.equal(pageSizeFor(50), 18);
   assert.equal(pageSizeFor(4), 4);
-  assert.throws(() => normalizeLimit(0), /between 1 and 200/u);
-  assert.throws(() => normalizeLimit(201), /between 1 and 200/u);
+  assert.throws(() => normalizeLimit(0), /between 1 and 12000/u);
+  assert.throws(() => normalizeLimit(12001), /between 1 and 12000/u);
 });
 
 test("extracts the logged-in self user only from the expected render path", () => {

@@ -4,13 +4,19 @@ import { buildDraftPlan, classifyFavorite } from "../src/classifier.mjs";
 
 test("classifies AI workflow content", () => {
   const result = classifyFavorite({ title: "Codex Skill 自动化工作流实战", author: "测试" });
-  assert.equal(result.folder, "AI工具与自动化");
+  assert.equal(result.folder, "AI与效率工具");
   assert.ok(result.confidence >= 0.58);
 });
 
-test("routes evidence-poor content to review", () => {
-  const result = classifyFavorite({ title: "今天聊一件事", author: "测试" });
+test("routes empty-title content to review instead of forcing a category", () => {
+  const result = classifyFavorite({ title: "   ", author: "测试" });
   assert.equal(result.folder, "待确认");
+  assert.ok(result.confidence < 0.58);
+});
+
+test("falls back to the broad life-wisdom category for unclassified content", () => {
+  const result = classifyFavorite({ title: "今天聊一件事", author: "测试" });
+  assert.equal(result.folder, "人生感悟与认知");
 });
 
 test("draft assigns every source video exactly once", () => {

@@ -179,7 +179,8 @@ export function buildDraftPlan(source, options = {}) {
       ({ name, description }) => ({ name, description, visibility: folderVisibility }),
     );
   }
-  if (used.has(uncertainFolder)) {
+  // 默认分类体系里已包含「待确认」；只有自定义 uncertainFolder 且尚未出现在 folders 时才补一次，避免重复。
+  if (used.has(uncertainFolder) && !folders.some(folder => folder.name === uncertainFolder)) {
     folders.push({ name: uncertainFolder, description: "证据不足或分类置信度较低，等待人工确认", visibility: folderVisibility });
   }
   const plan = {
@@ -197,7 +198,17 @@ export function buildDraftPlan(source, options = {}) {
 
 export function aiClassifyFavorite(favorite) {
   const t = `${favorite.title || ""} ${favorite.author || ""}`.toLowerCase();
-  const title = favorite.title || "";
+  const title = String(favorite.title || "").trim();
+  // 标题为空、完全没有可分类证据时，进入「待确认」，而不是硬塞进兜底夹。
+  if (!title) {
+    return {
+      folder: "待确认",
+      confidence: 0.1,
+      reason: "标题为空，缺乏分类证据，待人工确认",
+      evidence: [],
+      engine: "semantic-v1",
+    };
+  }
   for (const rule of RULES) {
     if (rule.test(t)) {
       return {
@@ -220,6 +231,7 @@ export function aiClassifyFavorite(favorite) {
 }
 
 // 兼容旧接口：默认走语义分类器（不再使用关键词计数）。
+// `mode` 参数为将来接入真实 AI 分类预留，当前分类器是确定性规则匹配，忽略该值。
 export function classifyFavorite(favorite, { uncertainFolder = "待确认", mode = "ai" } = {}) {
   const result = aiClassifyFavorite(favorite);
   if (result.folder === "待确认" && uncertainFolder !== "待确认") {

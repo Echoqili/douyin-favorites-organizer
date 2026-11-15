@@ -45,7 +45,7 @@ export function sanitizeFavorite(row, rank) {
   };
 }
 
-export async function collectFavorites({ limit = 200, offset = 0, outputDirectory } = {}) {
+export async function collectFavorites({ limit = 12000, offset = 0, outputDirectory } = {}) {
   const normalizedLimit = Number(limit);
   if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 12000) {
     throw new Error("limit must be an integer between 1 and 12000");

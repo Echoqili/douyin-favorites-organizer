@@ -42,7 +42,7 @@ async function main() {
   const args = parseArgs(rest);
   if (command === "collect") {
     const result = await collectFavorites({
-      limit: args.limit ? Number(args.limit) : 200,
+      limit: args.limit ? Number(args.limit) : 12000,
       offset: args.offset ? Number(args.offset) : 0,
       outputDirectory: args.out ? path.resolve(args.out) : undefined,
     });

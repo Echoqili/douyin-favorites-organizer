@@ -131,7 +131,11 @@ export function prepareIncrementalRun(runDirectory, { stateFile } = {}) {
 
 export function commitIncrementalRun(runDirectory, { stateFile } = {}) {
   const run = path.resolve(runDirectory);
-  const summary = readJson(path.join(run, "incremental-summary.json"));
+  const summaryFile = path.join(run, "incremental-summary.json");
+  if (!fs.existsSync(summaryFile)) {
+    throw new Error(`Missing ${summaryFile}. Run \`npm run incremental -- --run <RUN_DIR>\` before committing state.`);
+  }
+  const summary = readJson(summaryFile);
   const source = readJson(path.join(run, "favorites.json"));
   const incrementalSource = readJson(path.join(run, "incremental-favorites.json"));
   const resolvedStateFile = path.resolve(stateFile || summary.state_file);

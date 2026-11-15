@@ -9,22 +9,22 @@ test("account-write browser commands require a foreground window", () => {
   assert.equal(browserWindowMode("add-folder"), "foreground");
 });
 
-test("account-write commands replace a possibly background inspection session", () => {
+test("account-write commands reuse the existing session and require a foreground window", () => {
   assert.deepEqual(browserSessionPolicy("inspect-folders"), {
     windowMode: "background",
     resetExisting: false,
   });
   assert.deepEqual(browserSessionPolicy("preflight"), {
     windowMode: "foreground",
-    resetExisting: true,
+    resetExisting: false,
   });
   assert.deepEqual(browserSessionPolicy("create-folders"), {
     windowMode: "foreground",
-    resetExisting: true,
+    resetExisting: false,
   });
   assert.deepEqual(browserSessionPolicy("add-folder"), {
     windowMode: "foreground",
-    resetExisting: true,
+    resetExisting: false,
   });
 });
 
