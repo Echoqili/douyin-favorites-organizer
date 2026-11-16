@@ -140,104 +140,189 @@ async function probeVideoPage() {
     const visible = el => el && (el.offsetWidth || el.offsetHeight);
     const bodyText = document.body.innerText || '';
     const title = document.title || '';
-    // 收藏/取消收藏按钮：精确文本匹配（参考 apply-browser 的 clickExactText 思路）
+    const attr = (el, name) => el?.getAttribute(name) || '';
+    // 收藏/取消收藏：精确文本匹配
     const collectButtons = [...document.querySelectorAll('*')]
       .filter(el => visible(el) && (el.innerText || '').trim() === '收藏')
-      .map(el => ({ tag: el.tagName, cls: String(el.className || '').slice(0, 60), aria: el.getAttribute('aria-label') || '' }));
+      .map(el => ({ tag: el.tagName, cls: attr(el, 'class').slice(0, 60), aria: attr(el, 'aria-label'), e2e: attr(el, 'data-e2e') || attr(el, 'data-testid') }));
     const uncollectButtons = [...document.querySelectorAll('*')]
       .filter(el => visible(el) && (el.innerText || '').trim() === '取消收藏')
-      .map(el => ({ tag: el.tagName, cls: String(el.className || '').slice(0, 60) }));
+      .map(el => ({ tag: el.tagName, cls: attr(el, 'class').slice(0, 60), aria: attr(el, 'aria-label') }));
+    // 含「收藏」子串的可见元素（图标按钮文字可能带数字/被拆分）
+    const collectSubstring = [...document.querySelectorAll('*')]
+      .filter(el => visible(el) && (el.innerText || '').includes('收藏'))
+      .map(el => ({ tag: el.tagName, text: (el.innerText || '').trim().slice(0, 20), cls: attr(el, 'class').slice(0, 60), aria: attr(el, 'aria-label'), e2e: attr(el, 'data-e2e') || attr(el, 'data-testid') }))
+      .slice(0, 12);
+    // aria-label 含「收藏」
+    const ariaCollect = [...document.querySelectorAll('[aria-label]')]
+      .filter(el => (attr(el, 'aria-label') || '').includes('收藏'))
+      .map(el => ({ tag: el.tagName, aria: attr(el, 'aria-label'), cls: attr(el, 'class').slice(0, 60), e2e: attr(el, 'data-e2e') || attr(el, 'data-testid') }))
+      .slice(0, 12);
+    // data-e2e / data-testid 含收藏/collect/fav
+    const e2eCollect = [...document.querySelectorAll('[data-e2e],[data-testid]')]
+      .filter(el => /collect|fav|收藏/u.test(attr(el, 'data-e2e') + attr(el, 'data-testid')))
+      .map(el => ({ tag: el.tagName, e2e: attr(el, 'data-e2e') || attr(el, 'data-testid'), aria: attr(el, 'aria-label'), text: (el.innerText || '').trim().slice(0, 20) }))
+      .slice(0, 20);
+    // 页面所有 iframe（视频/操作区可能藏在 iframe 里）
+    const iframes = [...document.querySelectorAll('iframe')].map(f => f.src).filter(Boolean).slice(0, 10);
+    // 所有可见 button（含 role=button）文本，帮助识别操作栏
+    const allButtons = [...document.querySelectorAll('button,[role=button]')]
+      .filter(el => visible(el))
+      .map(el => ({ tag: el.tagName, text: (el.innerText || '').trim().slice(0, 12), aria: attr(el, 'aria-label'), e2e: attr(el, 'data-e2e') || attr(el, 'data-testid') }))
+      .slice(0, 30);
     const unavailable = /(视频不见了|视频不存在|内容不存在|作品已删除|该视频不存在|内容已删除|审核中|内容审核中|已失效|已删除|访问的内容不存在|作品不存在)/.test(bodyText);
     return {
       url: location.href,
       title,
       unavailable,
+      bodyContainsCollect: bodyText.includes('收藏'),
       bodyTextSample: bodyText.slice(0, 300),
       collectButtonCount: collectButtons.length,
       collectButtons: collectButtons.slice(0, 5),
       uncollectButtonCount: uncollectButtons.length,
       uncollectButtons: uncollectButtons.slice(0, 3),
+      collectSubstring,
+      ariaCollect,
+      e2eCollect,
+      iframes,
+      allButtons,
       hasLogin: bodyText.includes('登录'),
     };
   })()`);
 }
 
-// 点「收藏」按钮，尝试弹出收藏夹选择器。返回点击结果与弹窗状态。
-// 注意：抖音视频页点击收藏可能直接快捷收藏（无弹窗），也可能弹选择器，probe 会告诉我们。
+// 点「收藏」按钮（真实 CDP 点击，抖音控件忽略 JS 合成 click 事件）。
+// 精确定位：div[data-e2e="video-player-collect"]（抖音 web 收藏按钮，纯图标无文字）。
+// 点击后可能直接快捷收藏（无弹窗），也可能弹收藏夹选择器，probe 会告诉我们。
 async function clickCollectButton() {
-  return evaluate(`(() => {
-    const visible = el => el && (el.offsetWidth || el.offsetHeight);
-    const target = [...document.querySelectorAll('*')]
-      .filter(el => visible(el) && (el.innerText || '').trim() === '收藏')
-      .find(el => el.children.length === 0) || [...document.querySelectorAll('*')]
-      .filter(el => visible(el) && (el.innerText || '').trim() === '收藏').at(-1);
-    if (!target) return { clicked: false, reason: 'no 收藏 button' };
-    target.click();
-    return { clicked: true, tag: target.tagName, cls: String(target.className || '').slice(0, 60) };
-  })()`);
+  const clicked = await browser("click", '[data-e2e="video-player-collect"]');
+  return { ...clicked, via: "data-e2e-cdp" };
 }
 
 // 探测收藏夹选择器弹窗（点收藏后出现的）。dump 目标夹是否可见、勾选控件、确认按钮。
 async function probeCollectPicker(folder) {
   return evaluate(`(() => {
     const visible = el => el && (el.offsetWidth || el.offsetHeight);
-    const dialog = [...document.querySelectorAll('[role=dialog]')].find(el => visible(el));
     const bodyText = document.body.innerText || '';
+    // 弹窗容器：role=dialog 或 class 含 modal/mask/popup/panel 的可见容器（抖音用 Semi Design）
+    const dialogs = [...document.querySelectorAll('[role=dialog],.semi-modal,[class*=modal],[class*=mask],[class*=popup],[class*=panel]')]
+      .filter(visible)
+      .map(el => ({ cls: String(el.className || '').slice(0, 80), text: (el.innerText || '').trim().slice(0, 200) }))
+      .slice(0, 10);
     // 目标夹行：文本含夹名
     const folderCandidates = [...document.querySelectorAll('*')]
       .filter(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)});
+    // 目标夹元素向上遍历，找含 checkbox 的祖先层级（确认勾选控件的相对位置）
+    const folderLeaf = [...folderCandidates].sort((a, b) => a.children.length - b.children.length)[0];
+    const chain = [];
+    let node = folderLeaf;
+    for (let i = 0; i < 6 && node; i += 1) {
+      chain.push({
+        level: i,
+        tag: node.tagName,
+        cls: String(node.className || '').slice(0, 70),
+        hasSemiCheck: !!node.querySelector?.('span.semi-checkbox'),
+        hasInputCheck: !!node.querySelector?.('input[type=checkbox]'),
+        childCount: node.children?.length || 0,
+      });
+      node = node.parentElement;
+    }
     // 确认按钮候选（抖音不同场景用不同文案）
     const confirmButtons = [...document.querySelectorAll('button')]
       .filter(el => visible(el) && ['确定', '完成', '保存'].includes((el.innerText || '').trim()))
       .map(el => ({ text: el.innerText.trim(), disabled: !!el.disabled, cls: String(el.className || '').slice(0, 60) }));
-    // 半 Design checkbox（apply-browser 已验证批量管理弹窗用 span.semi-checkbox）
+    // 各类 checkbox 控件
     const semiCheckboxes = document.querySelectorAll('span.semi-checkbox').length;
+    const nativeCheckboxes = document.querySelectorAll('input[type=checkbox]').length;
+    const e2eChecks = [...document.querySelectorAll('[data-e2e],[data-testid]')]
+      .filter(el => /check|select|pick|fold/u.test((el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '')))
+      .map(el => ({ e2e: el.getAttribute('data-e2e') || el.getAttribute('data-testid'), tag: el.tagName, text: (el.innerText || '').trim().slice(0, 16) }))
+      .slice(0, 20);
     return {
-      dialogOpen: !!dialog,
-      bodyTextSample: bodyText.slice(0, 400),
+      dialogCount: dialogs.length,
+      dialogs,
+      bodyHasFolderWord: bodyText.includes('收藏夹'),
+      bodyHasNewFolderWord: bodyText.includes('新建收藏夹'),
+      bodyHasCollectWord: bodyText.includes('已收藏') || bodyText.includes('取消收藏'),
+      bodyTextSample: bodyText.slice(0, 500),
       folderTextMatches: folderCandidates.length,
       folderTag: folderCandidates[0]?.tagName || null,
+      folderRowChain: chain,
       confirmButtons,
       semiCheckboxes,
+      nativeCheckboxes,
+      e2eChecks,
     };
   })()`);
 }
 
 // 在收藏夹选择器弹窗里勾选目标夹并确认。
-// 选择器细节待 probe 校准；此处先用与批量管理一致的 semi-checkbox 定位（最可能兼容）。
-async function pickFolderAndConfirm(folder) {
-  // 1) 定位目标夹行，标记其 checkbox 供真实 CDP click
+// 已通过 probe 校准：目标夹名 SPAN 向上 2 层是含 span.semi-checkbox 的行容器；
+// 确认按钮是「保存」（button.semi-button-primary）。勾选态用行内 input[type=checkbox].checked 判断。
+// dryRun=true 时只定位+判断勾选态，不真正勾选/保存（供 dry-run 给出真实预测）。
+async function pickFolderAndConfirm(folder, { dryRun = false } = {}) {
+  // 1) 定位目标夹行（向上遍历找含 checkbox 的祖先），判断勾选态，标记 checkbox
   const marked = await evaluate(`(() => {
     const visible = el => el && (el.offsetWidth || el.offsetHeight);
     const candidates = [...document.querySelectorAll('*')]
-      .filter(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)});
-    if (candidates.length !== 1) return { ok: false, matches: candidates.length };
-    const row = candidates[0].parentElement?.parentElement || candidates[0].parentElement;
+      .filter(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)})
+      .sort((a, b) => a.children.length - b.children.length); // 叶子优先
+    if (candidates.length === 0) return { ok: false, matches: 0, reason: 'folder not visible in picker' };
+    const leaf = candidates[0];
+    let row = leaf;
+    for (let i = 0; i < 6 && row; i += 1) {
+      if (row.querySelector?.('span.semi-checkbox')) break;
+      row = row.parentElement;
+    }
     const control = row?.querySelector('span.semi-checkbox') || row?.querySelector('input[type=checkbox]');
-    if (!control) return { ok: false, matches: candidates.length, reason: 'no checkbox control in row' };
+    if (!control) return { ok: false, matches: candidates.length, reason: 'no checkbox in folder row' };
+    const input = row?.querySelector('input[type=checkbox]');
+    const alreadyChecked = !!(input?.checked) || control.classList?.contains('semi-checkbox-checked') || control.getAttribute('aria-checked') === 'true';
     control.setAttribute('data-organizer-folder-checkbox', 'video-page-destination');
-    return { ok: true, controlTag: control.tagName };
+    return { ok: true, controlTag: control.tagName, alreadyChecked };
   })()`);
   if (!marked.ok) return marked;
+  if (marked.alreadyChecked) return { ok: true, alreadyCollected: true, skipped: true };
+  if (dryRun) return { ok: true, alreadyChecked: false, dryRun: true, wouldCollect: true };
 
-  // 2) 真实 CDP 点击勾选
+  // 2) 真实 CDP 点击勾选（抖音控件忽略 JS 合成 click）
   const clicked = await browser("click", '[data-organizer-folder-checkbox="video-page-destination"]');
   if (!clicked.clicked || clicked.matches_n !== 1) return { ok: false, reason: `checkbox click failed: ${JSON.stringify(clicked)}` };
   await wait(0.4);
 
-  // 3) 点确认按钮
+  // 3) 点「保存」按钮（优先 semi-button-primary）
   const confirm = await evaluate(`(() => {
     const visible = el => el && (el.offsetWidth || el.offsetHeight);
     const btn = [...document.querySelectorAll('button')]
-      .find(el => visible(el) && ['确定', '完成', '保存'].includes((el.innerText || '').trim()) && !el.disabled);
-    if (!btn) return { ok: false, reason: 'no enabled confirm button' };
+      .find(el => visible(el) && !el.disabled && (el.innerText || '').trim() === '保存')
+      || [...document.querySelectorAll('button')]
+      .find(el => visible(el) && !el.disabled && ['确定', '完成'].includes((el.innerText || '').trim()));
+    if (!btn) return { ok: false, reason: 'no enabled save button' };
     btn.setAttribute('data-organizer-confirm', 'video-page-destination');
     return { ok: true, text: btn.innerText.trim() };
   })()`);
   if (!confirm.ok) return confirm;
   const confirmClick = await browser("click", '[data-organizer-confirm="video-page-destination"]');
   if (!confirmClick.clicked) return { ok: false, reason: `confirm click failed: ${JSON.stringify(confirmClick)}` };
-  return { ok: true, confirmText: confirm.text };
+  return { ok: true, confirmText: confirm.text, collected: true };
+}
+
+// 关闭收藏夹选择器弹窗（点遮罩），避免弹窗残留导致下次点收藏变成 toggle 关闭。
+async function closeCollectPicker() {
+  const marked = await evaluate(`(() => {
+    const visible = el => el && (el.offsetWidth || el.offsetHeight);
+    // 半 Design 弹窗遮罩：最外层 semi-always-dark，或 class 含 mask
+    const mask = [...document.querySelectorAll('.semi-always-dark,[class*=mask]')]
+      .find(el => visible(el));
+    if (mask) {
+      mask.setAttribute('data-organizer-close-mask', 'video-page-destination');
+      return { ok: true, cls: String(mask.className || '').slice(0, 60) };
+    }
+    return { ok: false, reason: 'no visible mask' };
+  })()`);
+  if (!marked.ok) return marked;
+  const clicked = await browser("click", '[data-organizer-close-mask="video-page-destination"]');
+  return { ok: !!clicked.clicked, via: 'mask' };
 }
 
 async function main() {
@@ -273,12 +358,17 @@ async function main() {
     await wait(3);
     const page = await probeVideoPage();
     process.stdout.write(`${JSON.stringify({ target, page }, null, 2)}\n`);
-    if (!page.unavailable && page.collectButtonCount > 0) {
-      // 只读探测：点收藏看弹窗结构，然后 dump（不确认、不写入）
+    const hasCollectButton = page.collectButtonCount > 0 || page.e2eCollect.length > 0;
+    if (!page.unavailable && hasCollectButton) {
+      // 点击前先探测是否有残留弹窗（上次 probe 可能没关）
+      const preClick = await probeCollectPicker(target.folder);
+      // 只读探测：点收藏看弹窗时序（弹窗可能延迟出现 / toggle 关闭）
       const clicked = await clickCollectButton();
+      await wait(0.8);
+      const pickerEarly = await probeCollectPicker(target.folder);
       await wait(1.5);
-      const picker = await probeCollectPicker(target.folder);
-      process.stdout.write(`${JSON.stringify({ clickResult: clicked, picker }, null, 2)}\n`);
+      const pickerLate = await probeCollectPicker(target.folder);
+      process.stdout.write(`${JSON.stringify({ preClick, clickResult: clicked, pickerEarly, pickerLate }, null, 2)}\n`);
     }
     return;
   }
@@ -321,34 +411,42 @@ async function main() {
             });
           }
           results.push({ aweme_id: target.aweme_id, status: "unavailable", folder: target.folder });
-        } else if (page.collectButtonCount === 0) {
+        } else if (!page.e2eCollect.some(e => e.e2e === "video-player-collect") && page.collectButtonCount === 0) {
           process.stderr.write(`${label} NO COLLECT BUTTON (page state unknown)\n`);
-          results.push({ aweme_id: target.aweme_id, status: "unknown", reason: "no 收藏 button", detail: page });
+          results.push({ aweme_id: target.aweme_id, status: "unknown", reason: "no collect button", detail: page });
         } else {
-          process.stderr.write(`${label} collecting -> ${target.folder}\n`);
-          if (dryRun) {
+          process.stderr.write(`${label} ${dryRun ? "DRY-RUN" : "collecting"} -> ${target.folder}\n`);
+          // 点收藏，弹收藏夹选择器
+          await clickCollectButton();
+          await wait(1.0);
+          const picked = await pickFolderAndConfirm(target.folder, { dryRun });
+          if (!picked.ok) {
+            process.stderr.write(`${label}   FAIL: ${picked.reason || "unknown"}\n`);
+            results.push({ aweme_id: target.aweme_id, status: "failed", reason: picked.reason, folder: target.folder });
+          } else if (picked.alreadyCollected) {
+            process.stderr.write(`${label}   ALREADY IN FOLDER (skip)\n`);
+            results.push({ aweme_id: target.aweme_id, status: "already-collected", folder: target.folder });
+          } else if (dryRun) {
+            process.stderr.write(`${label}   WOULD COLLECT (dry-run)\n`);
             results.push({ aweme_id: target.aweme_id, status: "dry-run", folder: target.folder });
           } else {
-            await clickCollectButton();
-            await wait(1.2);
-            const picked = await pickFolderAndConfirm(target.folder);
-            if (!picked.ok) {
-              results.push({ aweme_id: target.aweme_id, status: "failed", reason: picked.reason, folder: target.folder });
-            } else {
-              appendJournal(runDirectory, {
-                folder: target.folder,
-                ids: [target.aweme_id],
-                status: "verified",
-                verifiedCount: 1,
-                evidence: "collected via video detail page picker",
-              });
-              results.push({ aweme_id: target.aweme_id, status: "verified", folder: target.folder });
-            }
+            appendJournal(runDirectory, {
+              folder: target.folder,
+              ids: [target.aweme_id],
+              status: "verified",
+              verifiedCount: 1,
+              evidence: "collected via video detail page picker",
+            });
+            process.stderr.write(`${label}   COLLECTED\n`);
+            results.push({ aweme_id: target.aweme_id, status: "verified", folder: target.folder });
           }
+          // 无论成功与否，关闭可能残留的弹窗，避免下一条 toggle 失效
+          await closeCollectPicker().catch(() => {});
         }
       } catch (error) {
         process.stderr.write(`${label} ERROR: ${error.message}\n`);
         results.push({ aweme_id: target.aweme_id, status: "failed", reason: error.message, folder: target.folder });
+        await closeCollectPicker().catch(() => {});
       }
       // 节流：逐页导航比批量管理更易触发风控，每条间隔 2~5s 随机抖动
       await wait(2 + Math.random() * 3);
@@ -359,6 +457,7 @@ async function main() {
       dryRun,
       total: pending.length,
       verified: results.filter(r => r.status === "verified").length,
+      alreadyCollected: results.filter(r => r.status === "already-collected").length,
       unavailable: results.filter(r => r.status === "unavailable").length,
       failed: results.filter(r => r.status === "failed").length,
       skipped: results.filter(r => r.status === "skipped").length,
