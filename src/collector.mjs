@@ -16,8 +16,11 @@ export function cleanOpencliError(stdout, stderr) {
     .split(/\r?\n/u)
     .filter(line => !/UNDICI|EnvHttpProxyAgent|trace-warnings/u.test(line.trim()));
   const cleaned = lines.join("\n").trim();
+  if (/BROWSER_CONNECT/u.test(cleaned)) {
+    return "浏览器桥未连接：请打开 Chrome/Chromium 并启用 OpenCLI 扩展（chrome://extensions → 开发者模式 → 加载已解压扩展），保持浏览器常驻后重试。";
+  }
   if (/AUTH_REQUIRED/u.test(cleaned)) {
-    return "抖音登录态缺失：请确认 Chrome/Chromium 已打开并登录 https://www.douyin.com，且浏览器桥（opencli browser）处于运行状态后重试。";
+    return "抖音登录态缺失：请在已连接浏览器桥的 Chrome 中登录 https://www.douyin.com 后重试。";
   }
   return cleaned || "OpenCLI 执行失败，且无更多错误信息。";
 }
