@@ -14,6 +14,8 @@
 //       只读，列出待处理视频与推导出的目标夹（不碰浏览器）
 //   node scripts/apply-video-page.mjs probe --run <dir> [--id <aweme_id>]
 //       只读，打开单个视频详情页并 dump 真实 DOM（用于校准选择器），不写
+//   node scripts/apply-video-page.mjs observe --run <dir> [--id <aweme_id>]
+//       只读，勾选目标夹同时观察网络流量，回答「勾选是否真的提交到服务端」这一核心问题
 //   node scripts/apply-video-page.mjs apply --run <dir> [--limit N] [--dry-run]
 //       逐页写入，需 --execute --confirmation <token>
 
@@ -91,7 +93,25 @@ function runOpencli(args, { json = true } = {}) {
 const browser = (...args) => runOpencli(["browser", SESSION, ...args]);
 const evaluate = js => browser("eval", js);
 const wait = seconds => runOpencli(["browser", SESSION, "wait", "time", String(seconds)], { json: false });
+const network = (...args) => runOpencli(["browser", SESSION, "network", ...args]);
+const checkBox = (...args) => runOpencli(["browser", SESSION, "check", ...args]);
+const waitXhr = regex => runOpencli(["browser", SESSION, "wait", "xhr", regex]);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// 读取最近 sinceSeconds 秒内的网络请求，压缩成 {method,status,url,ct,size} 列表。
+// 用于回答核心问题：「勾选 checkbox 后是否真的发出了提交请求、打到哪个 endpoint」。
+// browser network 默认已过滤静态资源，这里再兜底过滤一次。
+async function readNetwork(sinceSeconds = 6) {
+  try {
+    const out = await network("--since", `${sinceSeconds}s`);
+    const entries = out?.entries || [];
+    return entries
+      .filter(e => e.url && !/\.(js|css|png|jpe?g|gif|webp|svg|woff2?|ico)(\?|$)/i.test(e.url))
+      .map(e => ({ method: e.method, status: e.status, url: e.url, ct: e.ct, size: e.size }));
+  } catch (error) {
+    return { error: error.message };
+  }
+}
 
 async function ensureSession({ windowMode = "foreground" } = {}) {
   // 复用现有 session：先探测 bridge 是否活着；活着就继续，死了才 open。
@@ -339,17 +359,22 @@ async function pickFolderAndConfirm(folder, { dryRun = false } = {}) {
   // 2) 真实 CDP 点击勾选（抖音控件忽略 JS 合成 click）
   const clicked = await browser("click", '[data-organizer-folder-checkbox="video-page-destination"]');
   if (!clicked.clicked || clicked.matches_n !== 1) return { ok: false, reason: `checkbox click failed: ${JSON.stringify(clicked)}` };
+  await wait(0.6);
+
+  // 2.5) 勾选后立即读网络：判断是否有提交请求发出（核心证据）。
+  //      若为空 → 说明勾选不提交，需另找「确认/保存/关闭即提交」的机制。
+  const networkAfterCheck = await readNetwork(3);
 
   // 3) 等待「保存」按钮出现（勾选后才出现/启用），真实 CDP 点击保存
   const save = await waitForSaveButton();
-  if (!save.ok) return save;
+  if (!save.ok) return { ...save, networkAfterCheck };
   const saveClicked = await browser("click", '[data-organizer-save="video-page-destination"]');
-  if (!saveClicked.clicked) return { ok: false, reason: `save click failed: ${JSON.stringify(saveClicked)}` };
+  if (!saveClicked.clicked) return { ok: false, reason: `save click failed: ${JSON.stringify(saveClicked)}`, networkAfterCheck };
   await wait(0.6);
 
   // 4) 校验：保存后弹窗关闭（semi-checkbox 消失）即视为成功
   const pickerClosed = await evaluate(`(() => document.querySelectorAll('span.semi-checkbox').length === 0)()`);
-  return { ok: true, collected: true, pickerClosed };
+  return { ok: true, collected: true, pickerClosed, networkAfterCheck };
 }
 
 // 等待「保存」按钮出现（勾选目标夹后，弹窗底部才出现/启用「保存」按钮）。
@@ -471,6 +496,85 @@ async function main() {
     return;
   }
 
+  if (command === "observe") {
+    if (!args.run) throw new Error("--run <directory> is required");
+    const { targets } = loadTargets(path.resolve(String(args.run)));
+    const target = args.id ? targets.find(t => t.aweme_id === String(args.id)) : targets[0];
+    if (!target) throw new Error("no target found to observe");
+    await ensureSession();
+    await browser("open", target.source_url, "--window", "foreground");
+    await wait(3);
+    const page = await probeVideoPage();
+    if (page.unavailable || (!page.e2eCollect.some(e => e.e2e === "video-player-collect") && page.collectButtonCount === 0)) {
+      process.stdout.write(`${JSON.stringify({ ok: false, reason: "not collectable", page }, null, 2)}\n`);
+      return;
+    }
+    await ensurePickerOpen();
+    // 定位目标夹（懒加载时滚动弹窗列表），标记 checkbox + 记录勾选前状态
+    const appeared = await locateFolderInPicker(target.folder, { timeoutMs: 8000 });
+    const marked = await evaluate(`(() => {
+      const candidates = [...document.querySelectorAll('*')]
+        .filter(el => (el.innerText || '').trim() === ${JSON.stringify(target.folder)})
+        .sort((a, b) => a.children.length - b.children.length);
+      for (const leaf of candidates) {
+        let row = leaf;
+        for (let i = 0; i < 6 && row; i += 1) {
+          if (row.querySelector?.('span.semi-checkbox')) break;
+          row = row.parentElement;
+        }
+        const control = row?.querySelector('span.semi-checkbox') || row?.querySelector('input[type=checkbox]');
+        if (!control) continue;
+        const input = row?.querySelector('input[type=checkbox]');
+        control.scrollIntoView({ block: 'center', inline: 'nearest' });
+        control.setAttribute('data-organizer-folder-checkbox', 'video-page-observe');
+        return {
+          ok: true,
+          controlTag: control.tagName,
+          controlCls: String(control.className || '').slice(0, 60),
+          inputTag: input?.tagName || null,
+          checkedBefore: !!(input?.checked) || control.classList?.contains('semi-checkbox-checked') || control.getAttribute('aria-checked') === 'true',
+        };
+      }
+      return { ok: false, reason: 'folder row not found' };
+    })()`);
+    // 勾选前网络基线（对照用）
+    const networkBefore = await readNetwork(4);
+    // 真实点击勾选
+    const clicked = await browser("click", '[data-organizer-folder-checkbox="video-page-observe"]');
+    await wait(0.5);
+    // 勾选后立即读 checkbox 态
+    const checkedAfter = await evaluate(`(() => {
+      const c = document.querySelector('[data-organizer-folder-checkbox="video-page-observe"]');
+      let input = null, node = c;
+      for (let i = 0; i < 4 && node; i += 1) { const ip = node.querySelector?.('input[type=checkbox]'); if (ip) { input = ip; break; } node = node.parentElement; }
+      return { checked: !!(input?.checked) || c?.classList?.contains('semi-checkbox-checked') || c?.getAttribute('aria-checked') === 'true' };
+    })()`);
+    // 勾选后等 2.5s 让可能的提交请求发出，再 dump 网络增量
+    await wait(2.5);
+    const networkAfter = await readNetwork(6);
+    // dump 弹窗内所有可见按钮，辅助判断是否存在「保存/确定」提交按钮
+    const confirmButtons = await evaluate(`(() => {
+      const visible = el => el && (el.offsetWidth || el.offsetHeight);
+      return [...document.querySelectorAll('button')]
+        .filter(b => visible(b))
+        .map(b => ({ text: (b.innerText || '').trim(), disabled: !!b.disabled }))
+        .filter(b => b.text);
+    })()`);
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      target: { aweme_id: target.aweme_id, folder: target.folder, source_url: target.source_url },
+      folderAppeared: appeared,
+      marked,
+      clickResult: clicked,
+      checkedAfter,
+      networkBefore,
+      networkAfter,
+      confirmButtons,
+    }, null, 2)}\n`);
+    await closeCollectPicker().catch(() => {});
+    return;
+  }
+
   if (command === "apply") {
     if (!args.run) throw new Error("--run <directory> is required");
     const runDirectory = path.resolve(String(args.run));
@@ -570,7 +674,7 @@ async function main() {
     return;
   }
 
-  throw new Error("Use inspect, probe, or apply");
+  throw new Error("Use inspect, probe, observe, or apply");
 }
 
 process.on("unhandledRejection", reason => {
