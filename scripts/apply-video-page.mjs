@@ -256,18 +256,52 @@ async function probeCollectPicker(folder) {
   })()`);
 }
 
+// 轮询等待目标夹在收藏夹选择器里出现（弹窗列表已确认全量渲染，此函数仅作渲染时机兜底）。
+async function waitForFolderInPicker(folder, { timeoutMs = 6000, intervalMs = 500 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await evaluate(`(() => {
+      const visible = el => el && (el.offsetWidth || el.offsetHeight);
+      return [...document.querySelectorAll('*')]
+        .some(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)});
+    })()`);
+    if (found) return true;
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
 // 在收藏夹选择器弹窗里勾选目标夹并确认。
 // 已通过 probe 校准：目标夹名 SPAN 向上 2 层是含 span.semi-checkbox 的行容器；
 // 确认按钮是「保存」（button.semi-button-primary）。勾选态用行内 input[type=checkbox].checked 判断。
 // dryRun=true 时只定位+判断勾选态，不真正勾选/保存（供 dry-run 给出真实预测）。
 async function pickFolderAndConfirm(folder, { dryRun = false } = {}) {
+  // 0) 等待目标夹出现（弹窗列表已确认全量渲染，目标夹精确匹配应秒出；留 4s 兜底）
+  const appeared = await waitForFolderInPicker(folder, { timeoutMs: 4000 });
+  if (!appeared) {
+    return { ok: false, reason: 'folder not in picker' };
+  }
+
   // 1) 定位目标夹行（向上遍历找含 checkbox 的祖先），判断勾选态，标记 checkbox
   const marked = await evaluate(`(() => {
     const visible = el => el && (el.offsetWidth || el.offsetHeight);
     const candidates = [...document.querySelectorAll('*')]
       .filter(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)})
       .sort((a, b) => a.children.length - b.children.length); // 叶子优先
-    if (candidates.length === 0) return { ok: false, matches: 0, reason: 'folder not visible in picker' };
+    if (candidates.length === 0) {
+      // 诊断：目标夹是否在 DOM 里、是否可见（区分「需滚动/懒加载」vs「夹不存在」）
+      const anyInDom = [...document.querySelectorAll('*')]
+        .filter(el => (el.innerText || '').includes(${JSON.stringify(folder)}))
+        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)
+        .slice(0, 5)
+        .map(el => ({ tag: el.tagName, text: (el.innerText || '').trim().slice(0, 40), visible: !!(el.offsetWidth || el.offsetHeight), cls: String(el.className || '').slice(0, 50) }));
+      // 弹窗内滚动容器：scrollHeight > clientHeight 说明列表可滚、存在未展开项
+      const scrollable = [...document.querySelectorAll('*')]
+        .filter(el => el.scrollHeight > el.clientHeight + 5 && el.clientHeight > 0)
+        .map(el => ({ tag: el.tagName, cls: String(el.className || '').slice(0, 60), clientHeight: el.clientHeight, scrollHeight: el.scrollHeight }))
+        .slice(0, 5);
+      return { ok: false, matches: 0, reason: 'folder not visible in picker', anyInDom, scrollable };
+    }
     const leaf = candidates[0];
     let row = leaf;
     for (let i = 0; i < 6 && row; i += 1) {
@@ -307,22 +341,37 @@ async function pickFolderAndConfirm(folder, { dryRun = false } = {}) {
   return { ok: true, confirmText: confirm.text, collected: true };
 }
 
-// 关闭收藏夹选择器弹窗（点遮罩），避免弹窗残留导致下次点收藏变成 toggle 关闭。
-async function closeCollectPicker() {
-  const marked = await evaluate(`(() => {
-    const visible = el => el && (el.offsetWidth || el.offsetHeight);
-    // 半 Design 弹窗遮罩：最外层 semi-always-dark，或 class 含 mask
-    const mask = [...document.querySelectorAll('.semi-always-dark,[class*=mask]')]
-      .find(el => visible(el));
-    if (mask) {
-      mask.setAttribute('data-organizer-close-mask', 'video-page-destination');
-      return { ok: true, cls: String(mask.className || '').slice(0, 60) };
+// 幂等打开收藏夹选择器并确认弹窗真的打开。
+// 可靠标志：存在 span.semi-checkbox 且存在「保存」按钮（bodyText 含「收藏夹」不可靠，弹窗标题会变）。
+// 先 ESC 清残留；再点收藏后轮询等待弹窗打开（最多 5s），避免「弹窗正在渲染就被误判未开」。
+async function ensurePickerOpen() {
+  await browser("keys", "Escape").catch(() => {});
+  await wait(0.3);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await clickCollectButton();
+    const deadline = Date.now() + 5000;
+    let open = false;
+    while (Date.now() < deadline) {
+      const state = await evaluate(`(() => {
+        const hasCheck = document.querySelectorAll('span.semi-checkbox').length > 0;
+        const hasSave = [...document.querySelectorAll('button')].some(b => (b.offsetWidth || b.offsetHeight) && (b.innerText || '').trim() === '保存');
+        return hasCheck && hasSave;
+      })()`);
+      if (state) { open = true; break; }
+      await sleep(500);
     }
-    return { ok: false, reason: 'no visible mask' };
-  })()`);
-  if (!marked.ok) return marked;
-  const clicked = await browser("click", '[data-organizer-close-mask="video-page-destination"]');
-  return { ok: !!clicked.clicked, via: 'mask' };
+    if (open) return { ok: true, attempt };
+    await browser("keys", "Escape").catch(() => {});
+    await wait(0.3);
+  }
+  return { ok: false, reason: 'picker did not open after retries' };
+}
+
+// 关闭收藏夹选择器弹窗（ESC 键最通用），避免弹窗残留导致下一条 toggle 失效。
+async function closeCollectPicker() {
+  await browser("keys", "Escape").catch(() => {});
+  await wait(0.3);
+  return { ok: true, via: "esc" };
 }
 
 async function main() {
@@ -416,13 +465,12 @@ async function main() {
           results.push({ aweme_id: target.aweme_id, status: "unknown", reason: "no collect button", detail: page });
         } else {
           process.stderr.write(`${label} ${dryRun ? "DRY-RUN" : "collecting"} -> ${target.folder}\n`);
-          // 点收藏，弹收藏夹选择器
-          await clickCollectButton();
-          await wait(1.0);
+          // 幂等打开收藏夹选择器（残留则复用，不 toggle）
+          await ensurePickerOpen();
           const picked = await pickFolderAndConfirm(target.folder, { dryRun });
           if (!picked.ok) {
-            process.stderr.write(`${label}   FAIL: ${picked.reason || "unknown"}\n`);
-            results.push({ aweme_id: target.aweme_id, status: "failed", reason: picked.reason, folder: target.folder });
+            process.stderr.write(`${label}   FAIL: ${picked.reason || "unknown"} | anyInDom=${JSON.stringify(picked.anyInDom)} | scrollable=${JSON.stringify(picked.scrollable)}\n`);
+            results.push({ aweme_id: target.aweme_id, status: "failed", reason: picked.reason, folder: target.folder, anyInDom: picked.anyInDom, scrollable: picked.scrollable });
           } else if (picked.alreadyCollected) {
             process.stderr.write(`${label}   ALREADY IN FOLDER (skip)\n`);
             results.push({ aweme_id: target.aweme_id, status: "already-collected", folder: target.folder });
