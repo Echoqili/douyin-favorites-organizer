@@ -72,7 +72,7 @@ Any action outside this scope requires fresh user approval.
    - Use `待确认` for weak, conflicting, or overly narrow evidence.
    - Keep `source_sha256` unchanged and reset approval to pending after editing.
 7. Run `validate` and `preview`. Under a valid standing authorization, verify the preview against the recurring limits, then use its token with `approve` without asking again.
-8. Run `manifest`, browser `preflight`, `create-folders`, and one `add-folder` batch at a time.
+8. Run `manifest`, browser `preflight`, `create-folders`, then one `apply-all` command for all remaining folder batches. `apply-all` must scan the union of target video IDs once, keep the writer tab in batch management, and use an independent verifier tab for each folder-count check. Use `add-folder` only as the bounded recovery path after an interrupted or unknown batch.
 9. Require verified journal coverage for every new ID or an explicit `unavailable` record.
 10. Run `npm run commit-state -- --run <RUN_DIR>` only after all planned new IDs are verified or unavailable.
 11. Close the automation browser session. Report changes and failures; a no-op run may stay quiet.
@@ -84,6 +84,7 @@ Follow [references/browser-apply.md](references/browser-apply.md). Derive the ex
 Completion requires:
 
 - Plan validation passed and its fingerprint matches the manifest.
+- The primary `apply-all` path completed at most one bounded saved-video scan for all unverified batches.
 - Every new folder has the requested visibility and a visible final state.
 - Existing-folder counts increased by the exact verified batch size.
 - Every new video is journaled as `verified` or `unavailable`.

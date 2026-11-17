@@ -23,18 +23,19 @@ Never rename, delete, merge, or change visibility of an existing folder.
 
 ## Add videos
 
-Process one folder at a time.
+Use `apply-all` as the primary path.
 
-1. Record the target folder's baseline `共 N 作品` count.
-2. Open `视频` → `批量管理`.
-3. Match cards by the exact numeric `/video/<aweme_id>` link, not title.
-4. Scroll bounded internal containers until every intended ID is mapped or the list stabilizes.
-5. Record persistently absent IDs as `unavailable`; never use a private endpoint to force a write.
-6. Select only the intended IDs and verify the selected count.
-7. Click `加入收藏夹`; never click `取消收藏`.
-8. Select the exact folder and submit once.
-9. Verify the final folder count equals baseline plus the verified batch size.
-10. Journal baseline, final count, IDs, and status before moving to the next folder.
+1. Keep the original browser tab as the writer and create one verifier tab in the same signed-in browser session.
+2. Read every target folder's baseline `共 N 作品` count from the verifier tab before writing.
+3. On the writer tab, open `视频` → `批量管理` once.
+4. Form the union of every unverified target `aweme_id`, then match cards by exact numeric `/video/<aweme_id>` links, not titles.
+5. Scroll bounded internal containers once until the union is mapped or the list stabilizes. Record persistently absent IDs against their planned folders as `unavailable`; never use a private endpoint to force a write.
+6. For each folder batch, require a clean writer state, select only that folder's available IDs, and verify the selected count.
+7. Click `加入收藏夹`; never click `取消收藏`. Select the exact folder and submit once.
+8. Require the writer tab to return to a clean batch-management state with zero selected video checkboxes.
+9. Refresh only the verifier tab and verify the folder count equals its baseline plus the verified batch size. Do not navigate the writer tab away from the loaded video list.
+10. Journal baseline, final count, IDs, and status before moving to the next folder. Stop on the first ambiguous writer or verifier result.
+11. Close the verifier tab at the end. Use one bounded `add-folder` command only to resume a remaining batch after a stopped `apply-all` run.
 
 An exact batch already marked `verified` in the journal may be skipped. Do not infer success from count alone after an unknown submit.
 
@@ -42,6 +43,6 @@ An exact batch already marked `verified` in the journal may be skipped. Do not i
 
 - Stop on ambiguous selectors, count mismatches, unknown dialogs, CAPTCHA, missing IDs, or uncertain submit results.
 - Do not repeat a submit until visible state proves the first attempt did not apply.
-- Resume only from current page state plus the local journal.
+- Resume only from current page state plus the local journal. `apply-all` skips an exact folder-and-ID batch already journaled as `verified`.
 - Hand CAPTCHA and login recovery to the user.
 - Never use undocumented private endpoints as a fallback.

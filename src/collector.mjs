@@ -1,8 +1,9 @@
-﻿import path from "node:path";
+import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import { ensureDirectory, sha256, timestampId, writeJson } from "./io.mjs";
+import { limits, normalizeLimit } from "../opencli-plugin/lib/saved-core.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LOCAL_OPENCLI = path.join(PROJECT_ROOT, "node_modules", "@jackwener", "opencli", "dist", "src", "main.js");
@@ -11,6 +12,7 @@ export function hasDouyinSavedCommand(output) {
   return /^\s{2}saved(?:\s|\[)/mu.test(String(output || ""));
 }
 
+// 把 OpenCLI 的底层报错转成干净的中文提示（登录缺失/浏览器桥未连接），过滤 UNDICI 警告噪音。
 export function cleanOpencliError(stdout, stderr) {
   const lines = `${stdout}\n${stderr}`
     .split(/\r?\n/u)
@@ -59,12 +61,8 @@ export function sanitizeFavorite(row, rank) {
   };
 }
 
-export async function collectFavorites({ limit = 12000, offset = 0, outputDirectory } = {}) {
-  const normalizedLimit = Number(limit);
-  if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 12000) {
-    throw new Error("limit must be an integer between 1 and 12000");
-  }
-  const normalizedOffset = Math.max(0, Number(offset) || 0);
+export async function collectFavorites({ limit = limits.default, outputDirectory } = {}) {
+  const normalizedLimit = normalizeLimit(limit);
   if (!fs.existsSync(LOCAL_OPENCLI)) {
     throw new Error("Project-local OpenCLI is missing. Run npm install first.");
   }
@@ -80,8 +78,6 @@ export async function collectFavorites({ limit = 12000, offset = 0, outputDirect
     "saved",
     "--limit",
     String(normalizedLimit),
-    "--offset",
-    String(normalizedOffset),
     "-f",
     "json",
   ]);
@@ -101,9 +97,12 @@ export async function collectFavorites({ limit = 12000, offset = 0, outputDirect
     captured_at: new Date().toISOString(),
     source: "opencli douyin saved",
     requested_limit: normalizedLimit,
-    requested_offset: normalizedOffset,
     count: favorites.length,
-    coverage_warning: favorites.length === normalizedLimit,
+    coverage_warning: false,
+    coverage: {
+      complete: true,
+      reason: "source_exhausted",
+    },
     source_sha256: sourceHash,
     favorites,
   };

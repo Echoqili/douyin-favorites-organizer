@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { partitionMappedTargets, targetCheckboxSelector } from "../src/browser-selection.mjs";
+import { mergeObservedMappedIds, mappedIdSignature, partitionMappedTargets, targetCheckboxSelector } from "../src/browser-selection.mjs";
 
 test("partitions persistently missing videos instead of failing the whole batch", () => {
   assert.deepEqual(
@@ -14,4 +14,12 @@ test("targets the controlled checkbox input instead of its inert wrapper", () =>
     targetCheckboxSelector("7671222361748659611"),
     '[data-organizer-target="7671222361748659611"]',
   );
+});
+
+
+test("accumulates mapped IDs across virtualized DOM snapshots and detects membership changes", () => {
+  const first = mergeObservedMappedIds([], [{ id: "1" }, { id: "2" }]);
+  const second = mergeObservedMappedIds(first, [{ id: "2" }, { id: "3" }]);
+  assert.deepEqual(second, ["1", "2", "3"]);
+  assert.notEqual(mappedIdSignature(["1", "2"]), mappedIdSignature(["2", "3"]));
 });

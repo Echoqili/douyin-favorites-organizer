@@ -1,5 +1,5 @@
-﻿const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 12000;
+const MAX_LIMIT = 5000;
+const DEFAULT_LIMIT = MAX_LIMIT;
 const PAGE_SIZE = 18;
 const SAVED_VIDEO_ENDPOINTS = [
   "/aweme/v1/web/aweme/listcollection/",
@@ -78,6 +78,47 @@ export function mergeCapturedSavedPages(pages, limit = MAX_LIMIT) {
     }
   }
   return items;
+}
+
+function pageHasMore(page) {
+  const value = page?.has_more ?? page?.hasMore;
+  if (value === false || value === 0 || value === "0") return false;
+  if (value === true || value === 1 || value === "1") return true;
+  return null;
+}
+
+export function savedCaptureCoverage(snapshot, limit = MAX_LIMIT) {
+  const normalizedLimit = normalizeLimit(limit);
+  const items = mergeCapturedSavedPages(snapshot?.pages, normalizedLimit);
+  const capturedIds = new Set(items.map(item => String(item?.aweme_id || item?.awemeId || "")));
+  const domIds = [...new Set((snapshot?.domIds || []).map(String).filter(Boolean))];
+  const missingDomIds = domIds.filter(id => !capturedIds.has(id));
+  const errors = Array.isArray(snapshot?.errors) ? snapshot.errors : [];
+  const pending = Number(snapshot?.pending || 0);
+  const relevantPages = (Array.isArray(snapshot?.pages) ? snapshot.pages : [])
+    .filter(page => SAVED_VIDEO_ENDPOINTS.some(candidate => String(page?.endpoint || "").includes(candidate)));
+  const lastPaginationValue = relevantPages
+    .map(pageHasMore)
+    .filter(value => value !== null)
+    .at(-1);
+  const sourceExhausted = lastPaginationValue === false;
+  const budgetExhausted = items.length >= normalizedLimit && !sourceExhausted;
+  let reason = "source_exhausted";
+  if (errors.length > 0) reason = "capture_errors";
+  else if (pending > 0) reason = "requests_pending";
+  else if (missingDomIds.length > 0) reason = "visible_items_missing";
+  else if (budgetExhausted) reason = "budget_exhausted";
+  else if (!sourceExhausted) reason = "pagination_not_exhausted";
+  return {
+    complete: reason === "source_exhausted",
+    reason,
+    count: items.length,
+    missing_dom_ids: missingDomIds,
+    capture_errors: errors.length,
+    pending,
+    source_exhausted: sourceExhausted,
+    budget_exhausted: budgetExhausted,
+  };
 }
 
 export function mapSavedAweme(aweme, rank, { includePlayUrl = false } = {}) {

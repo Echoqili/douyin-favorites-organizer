@@ -1,4 +1,4 @@
-﻿import { cli, Strategy } from "@jackwener/opencli/registry";
+import { cli, Strategy } from "@jackwener/opencli/registry";
 import {
   ArgumentError,
   AuthRequiredError,
@@ -11,6 +11,7 @@ import {
   mapSavedAweme,
   mergeCapturedSavedPages,
   normalizeLimit,
+  savedCaptureCoverage,
   unwrapEvaluateResult,
 } from "./lib/saved-core.mjs";
 
@@ -80,7 +81,7 @@ async function installSavedResponseCapture(page, includePlayUrl) {
       const baselineIds = Array.from(document.querySelectorAll('a[href*="/video/"]'))
         .map(link => String(link.href || '').match(/\\/video\\/(\\d{10,})/)?.[1] || '')
         .filter(Boolean);
-      const state = { pages: [], errors: [], pending: 0, baselineIds, restore: null };
+      const state = { pages: [], errors: [], pending: 0, baselineIds, observedDomIds: [], restore: null };
       const endpointFor = (value) => {
         const url = String(value || '');
         return endpoints.find(endpoint => url.includes(endpoint)) || '';
@@ -133,7 +134,20 @@ async function installSavedResponseCapture(page, includePlayUrl) {
       };
       const capture = (endpoint, data) => {
         const items = itemsFrom(data).map(sanitize).filter(item => item.aweme_id);
-        state.pages.push({ endpoint, items });
+        const hasMoreValue = data?.has_more ?? data?.hasMore ?? data?.data?.has_more ?? data?.data?.hasMore;
+        const hasMore = hasMoreValue === false || hasMoreValue === 0 || hasMoreValue === '0'
+          ? false
+          : hasMoreValue === true || hasMoreValue === 1 || hasMoreValue === '1'
+            ? true
+            : null;
+        const cursorValue = data?.cursor ?? data?.max_cursor ?? data?.maxCursor
+          ?? data?.data?.cursor ?? data?.data?.max_cursor ?? data?.data?.maxCursor ?? null;
+        state.pages.push({
+          endpoint,
+          items,
+          has_more: hasMore,
+          cursor: cursorValue == null ? null : String(cursorValue).slice(0, 80)
+        });
       };
       const recordError = (endpoint, error) => {
         state.errors.push({ endpoint, error: String(error?.message || error).slice(0, 240) });
@@ -147,15 +161,20 @@ async function installSavedResponseCapture(page, includePlayUrl) {
       window.fetch = async function(...args) {
         const requestUrl = typeof args[0] === 'string' ? args[0] : args[0]?.url;
         const endpoint = endpointFor(requestUrl);
-        const response = await originalFetch.apply(this, args);
-        if (endpoint) {
-          state.pending += 1;
+        if (!endpoint) return originalFetch.apply(this, args);
+        state.pending += 1;
+        try {
+          const response = await originalFetch.apply(this, args);
           response.clone().json()
             .then(data => capture(endpoint, data))
             .catch(error => recordError(endpoint, error))
             .finally(() => { state.pending -= 1; });
+          return response;
+        } catch (error) {
+          recordError(endpoint, error);
+          state.pending -= 1;
+          throw error;
         }
-        return response;
       };
       xhr.open = function(method, url) {
         Object.defineProperty(this, '__dokSavedEndpoint', {
@@ -165,22 +184,33 @@ async function installSavedResponseCapture(page, includePlayUrl) {
       };
       xhr.send = function() {
         const endpoint = this.__dokSavedEndpoint;
-        if (endpoint) {
-          state.pending += 1;
-          this.addEventListener('loadend', function() {
-            try {
-              const data = this.responseType === 'json'
-                ? this.response
-                : JSON.parse(String(this.responseText || ''));
-              capture(endpoint, data);
-            } catch (error) {
-              recordError(endpoint, error);
-            } finally {
-              state.pending -= 1;
-            }
-          }, { once: true });
+        if (!endpoint) return originalSend.apply(this, arguments);
+        state.pending += 1;
+        let settled = false;
+        const settle = () => {
+          if (settled) return;
+          settled = true;
+          state.pending -= 1;
+        };
+        this.addEventListener('loadend', function() {
+          try {
+            const data = this.responseType === 'json'
+              ? this.response
+              : JSON.parse(String(this.responseText || ''));
+            capture(endpoint, data);
+          } catch (error) {
+            recordError(endpoint, error);
+          } finally {
+            settle();
+          }
+        }, { once: true });
+        try {
+          return originalSend.apply(this, arguments);
+        } catch (error) {
+          recordError(endpoint, error);
+          settle();
+          throw error;
         }
-        return originalSend.apply(this, arguments);
       };
       state.restore = () => {
         window.fetch = originalFetch;
@@ -201,15 +231,14 @@ async function readSavedCapture(page) {
     (() => {
       const state = window[${JSON.stringify(CAPTURE_KEY)}] || {};
       const ids = [];
-      const seen = new Set();
+      const seen = new Set(Array.isArray(state.observedDomIds) ? state.observedDomIds : []);
       const baselineIds = new Set(Array.isArray(state.baselineIds) ? state.baselineIds : []);
       for (const link of document.querySelectorAll('a[href*="/video/"]')) {
         const match = String(link.href || '').match(/\\/video\\/(\\d{10,})/);
-        if (match && !baselineIds.has(match[1]) && !seen.has(match[1])) {
-          seen.add(match[1]);
-          ids.push(match[1]);
-        }
+        if (match && !baselineIds.has(match[1])) seen.add(match[1]);
       }
+      ids.push(...seen);
+      state.observedDomIds = ids;
       return {
         pages: Array.isArray(state.pages) ? state.pages : [],
         errors: Array.isArray(state.errors) ? state.errors : [],
@@ -233,28 +262,48 @@ async function scrollSavedPage(page) {
   `);
 }
 
-async function captureSavedVideos(page, target, offset) {
+async function captureSavedVideos(page, limit) {
   let snapshot = { pages: [], errors: [], pending: 0, domIds: [] };
   let previousSignature = "";
   let stableRounds = 0;
 
-  for (let attempt = 0; attempt < 600; attempt += 1) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
     await page.wait(0.75);
     snapshot = await readSavedCapture(page);
-    const allItems = mergeCapturedSavedPages(snapshot.pages, limits.max);
-    const signature = `${allItems.length}:${snapshot.domIds.length}:${snapshot.pages.length}`;
-    if (snapshot.pending === 0 && signature === previousSignature) stableRounds += 1;
+    const coverage = savedCaptureCoverage(snapshot, limits.max);
+    const signature = JSON.stringify({
+      count: coverage.count,
+      domIds: [...snapshot.domIds].sort(),
+      pages: snapshot.pages.length,
+      pending: coverage.pending,
+      sourceExhausted: coverage.source_exhausted,
+    });
+    if (coverage.pending === 0 && signature === previousSignature) stableRounds += 1;
     else stableRounds = 0;
     previousSignature = signature;
 
-    if (allItems.length >= target) break;
-    if (allItems.length > 0 && stableRounds >= 5) break;
+    if (coverage.complete && stableRounds >= 2) break;
+    if (coverage.capture_errors > 0 || (coverage.budget_exhausted && stableRounds >= 2)) break;
     await scrollSavedPage(page);
   }
 
   snapshot = await readSavedCapture(page);
   const allItems = mergeCapturedSavedPages(snapshot.pages, limits.max);
-return allItems.slice(offset, target);
+  const coverage = savedCaptureCoverage(snapshot, limits.max);
+  if (!coverage.complete) {
+    throw new CommandExecutionError(
+      `Douyin saved capture was incomplete (${coverage.reason}): `
+      + `${coverage.missing_dom_ids.length} visible video(s) missing, ${snapshot.pages.length} captured page(s), `
+      + `${coverage.count} captured video(s), ${coverage.capture_errors} capture error(s), ${coverage.pending} pending request(s).`
+    );
+  }
+  if (allItems.length > limit) {
+    throw new CommandExecutionError(
+      `Douyin saved capture contains ${allItems.length} videos, which exceeds requested limit ${limit}. `
+      + `Retry with --limit ${Math.min(limits.max, allItems.length)} or higher so the result remains complete.`
+    );
+  }
+  return allItems;
 }
 
 async function restoreSavedResponseCapture(page) {
@@ -289,12 +338,6 @@ cli({
       default: false,
       help: "Include a transient signed media URL for immediate local download",
     },
-    {
-      name: "offset",
-      type: "int",
-      default: 0,
-      help: "Number of saved videos to skip before returning results (batch backfill)",
-    },
   ],
   columns: [
     "rank",
@@ -310,8 +353,6 @@ cli({
   ],
   func: async (page, kwargs) => {
     const limit = parseLimit(kwargs.limit);
-    const offset = Math.max(0, Number(kwargs.offset || 0));
-    const target = offset + limit;
     const includePlayUrl = kwargs.include_play_url === true;
     await page.goto(SAVED_PAGE_URL);
     await page.wait(3);
@@ -342,7 +383,7 @@ cli({
       if (!clicked) {
         throw new CommandExecutionError("Could not open the Douyin saved video tab");
       }
-      const items = await captureSavedVideos(page, target, offset);
+      const items = await captureSavedVideos(page, limit);
       if (items.length === 0) {
         throw new EmptyResultError(
           "douyin saved",

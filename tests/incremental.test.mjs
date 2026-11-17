@@ -58,3 +58,66 @@ test("commits only completed incremental assignments", () => {
   assert.equal(result.state.folders[0].visibility, "public");
   assert.equal(result.stateFile, prepared.stateFile);
 });
+
+
+test("partially commits verified items while deferred items remain new on the next run", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "douyin-incremental-"));
+  const run = path.join(root, "runs", "current");
+  const nextRun = path.join(root, "runs", "next");
+  const stateFile = path.join(root, "state.json");
+  writeJson(path.join(run, "favorites.json"), {
+    captured_at: "2026-09-21T00:00:00Z",
+    source: "test",
+    count: 2,
+    coverage_warning: false,
+    favorites: [favorite("10", "成功"), favorite("11", "稍后重试")],
+  });
+  prepareIncrementalRun(run, { stateFile });
+  writeJson(path.join(run, "classification-plan.json"), {
+    folders: [],
+    existing_folders: ["AI工具"],
+    assignments: [
+      { aweme_id: "10", folder: "AI工具", confidence: 0.9 },
+      { aweme_id: "11", folder: "AI工具", confidence: 0.9 },
+    ],
+  });
+  fs.writeFileSync(path.join(run, "apply-journal.jsonl"), [
+    JSON.stringify({ status: "verified", aweme_ids: ["10"] }),
+    JSON.stringify({ status: "deferred", aweme_ids: ["11"] }),
+    "",
+  ].join("\n"), "utf8");
+
+  const committed = commitIncrementalRun(run, { stateFile });
+  assert.equal(committed.committed, 1);
+  assert.deepEqual(committed.deferred, ["11"]);
+  assert.equal(Boolean(committed.state.videos["10"]), true);
+  assert.equal(Boolean(committed.state.videos["11"]), false);
+
+  writeJson(path.join(nextRun, "favorites.json"), {
+    captured_at: "2026-09-21T01:00:00Z",
+    source: "test",
+    count: 2,
+    coverage_warning: false,
+    favorites: [favorite("10", "成功"), favorite("11", "稍后重试")],
+  });
+  const prepared = prepareIncrementalRun(nextRun, { stateFile });
+  assert.deepEqual(prepared.summary.new_aweme_ids, ["11"]);
+});
+
+test("unknown submit still blocks every state commit", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "douyin-incremental-"));
+  const run = path.join(root, "runs", "current");
+  writeJson(path.join(run, "favorites.json"), {
+    captured_at: "2026-09-21T00:00:00Z",
+    source: "test",
+    count: 1,
+    coverage_warning: false,
+    favorites: [favorite("20", "未知结果")],
+  });
+  prepareIncrementalRun(run);
+  writeJson(path.join(run, "classification-plan.json"), {
+    folders: [], existing_folders: ["AI工具"], assignments: [{ aweme_id: "20", folder: "AI工具" }],
+  });
+  fs.writeFileSync(path.join(run, "apply-journal.jsonl"), JSON.stringify({ status: "unknown", aweme_ids: ["20"] }) + "\n", "utf8");
+  assert.throws(() => commitIncrementalRun(run), /unknown submit.*20/iu);
+});

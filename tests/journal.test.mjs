@@ -22,6 +22,18 @@ test("journals only non-sensitive batch evidence", () => {
   assert.equal(fs.readFileSync(result.file, "utf8").trim().length > 0, true);
 });
 
+test("accepts deferred work that must remain retryable", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "douyin-organizer-"));
+  const result = appendJournal(directory, {
+    folder: "待处理",
+    ids: ["3"],
+    status: "deferred",
+    evidence: "not found during the bounded browser scan",
+  });
+  assert.equal(result.record.status, "deferred");
+  assert.equal(result.record.verified_count, 0);
+});
+
 test("rejects sensitive evidence", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "douyin-organizer-"));
   assert.throws(() => appendJournal(directory, {
