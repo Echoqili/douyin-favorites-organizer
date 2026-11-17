@@ -42,10 +42,21 @@ function argsMap(values) {
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (!value.startsWith("--")) { result._.push(value); continue; }
-    const key = value.slice(2).replaceAll("-", "_");
-    const next = values[index + 1];
-    if (!next || next.startsWith("--")) result[key] = true;
-    else { result[key] = next; index += 1; }
+    let key = value.slice(2);
+    let val;
+    if (key.includes("=")) {
+      const eq = key.indexOf("=");
+      val = key.slice(eq + 1);
+      key = key.slice(0, eq);
+    } else {
+      const next = values[index + 1];
+      if (!next || next.startsWith("--")) val = true;
+      else { val = next; index += 1; }
+    }
+    key = key.replaceAll("-", "_");
+    if (val === "true") val = true;
+    else if (val === "false") val = false;
+    result[key] = val;
   }
   return result;
 }
@@ -256,64 +267,70 @@ async function probeCollectPicker(folder) {
   })()`);
 }
 
-// 轮询等待目标夹在收藏夹选择器里出现（弹窗列表已确认全量渲染，此函数仅作渲染时机兜底）。
-async function waitForFolderInPicker(folder, { timeoutMs = 6000, intervalMs = 500 } = {}) {
+// 定位目标夹：DOM 精确匹配（不要求 visible，滚出可视区/懒加载前的元素也在 DOM 里）；
+// 找不到则滚动弹窗列表容器触发懒加载，再重试。弹窗收藏夹列表是懒加载的，靠后的夹需滚动才会渲染。
+async function locateFolderInPicker(folder, { timeoutMs = 8000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const found = await evaluate(`(() => {
-      const visible = el => el && (el.offsetWidth || el.offsetHeight);
       return [...document.querySelectorAll('*')]
-        .some(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)});
+        .some(el => (el.innerText || '').trim() === ${JSON.stringify(folder)});
     })()`);
     if (found) return true;
-    await sleep(intervalMs);
+    // 滚动弹窗内「含 checkbox 的可滚列表容器」，触发靠后夹的懒加载
+    const scrolled = await evaluate(`(() => {
+      const scroller = [...document.querySelectorAll('*')].find(el => {
+        if (!(el.scrollHeight > el.clientHeight + 5)) return false;
+        const oy = getComputedStyle(el).overflowY;
+        return (oy === 'auto' || oy === 'scroll') && el.querySelector('span.semi-checkbox');
+      });
+      if (!scroller) return false;
+      scroller.scrollTop += Math.max(300, Math.floor(scroller.clientHeight * 0.7));
+      return true;
+    })()`);
+    if (!scrolled) break; // 无可滚容器，非懒加载问题，退出
+    await sleep(400);
   }
   return false;
 }
 
 // 在收藏夹选择器弹窗里勾选目标夹并确认。
 // 已通过 probe 校准：目标夹名 SPAN 向上 2 层是含 span.semi-checkbox 的行容器；
-// 确认按钮是「保存」（button.semi-button-primary）。勾选态用行内 input[type=checkbox].checked 判断。
+// 交互是「勾选 checkbox → 点『保存』按钮」两步（保存按钮勾选后才出现/启用）；
+// 勾选态用行内 input[type=checkbox].checked 判断。
 // dryRun=true 时只定位+判断勾选态，不真正勾选/保存（供 dry-run 给出真实预测）。
 async function pickFolderAndConfirm(folder, { dryRun = false } = {}) {
-  // 0) 等待目标夹出现（弹窗列表已确认全量渲染，目标夹精确匹配应秒出；留 4s 兜底）
-  const appeared = await waitForFolderInPicker(folder, { timeoutMs: 4000 });
+  // 0) 定位目标夹：DOM 精确匹配 + 找不到则滚动弹窗列表触发懒加载
+  const appeared = await locateFolderInPicker(folder, { timeoutMs: 8000 });
   if (!appeared) {
     return { ok: false, reason: 'folder not in picker' };
   }
 
-  // 1) 定位目标夹行（向上遍历找含 checkbox 的祖先），判断勾选态，标记 checkbox
+  // 1) 定位目标夹行（逐个候选向上遍历找含 checkbox 的祖先），判断勾选态，标记 checkbox。
+  //    不要求 visible：滚出可视区的项也在 DOM 里，scrollIntoView 后再真实 CDP 点击。
   const marked = await evaluate(`(() => {
-    const visible = el => el && (el.offsetWidth || el.offsetHeight);
     const candidates = [...document.querySelectorAll('*')]
-      .filter(el => visible(el) && (el.innerText || '').trim() === ${JSON.stringify(folder)})
+      .filter(el => (el.innerText || '').trim() === ${JSON.stringify(folder)})
       .sort((a, b) => a.children.length - b.children.length); // 叶子优先
     if (candidates.length === 0) {
-      // 诊断：目标夹是否在 DOM 里、是否可见（区分「需滚动/懒加载」vs「夹不存在」）
-      const anyInDom = [...document.querySelectorAll('*')]
-        .filter(el => (el.innerText || '').includes(${JSON.stringify(folder)}))
-        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)
-        .slice(0, 5)
-        .map(el => ({ tag: el.tagName, text: (el.innerText || '').trim().slice(0, 40), visible: !!(el.offsetWidth || el.offsetHeight), cls: String(el.className || '').slice(0, 50) }));
-      // 弹窗内滚动容器：scrollHeight > clientHeight 说明列表可滚、存在未展开项
-      const scrollable = [...document.querySelectorAll('*')]
-        .filter(el => el.scrollHeight > el.clientHeight + 5 && el.clientHeight > 0)
-        .map(el => ({ tag: el.tagName, cls: String(el.className || '').slice(0, 60), clientHeight: el.clientHeight, scrollHeight: el.scrollHeight }))
-        .slice(0, 5);
-      return { ok: false, matches: 0, reason: 'folder not visible in picker', anyInDom, scrollable };
+      return { ok: false, matches: 0, reason: 'folder not in picker DOM' };
     }
-    const leaf = candidates[0];
-    let row = leaf;
-    for (let i = 0; i < 6 && row; i += 1) {
-      if (row.querySelector?.('span.semi-checkbox')) break;
-      row = row.parentElement;
+    // 逐个候选：向上找含 checkbox 的行容器（过滤「夹名出现在弹窗标题/描述」的假匹配）
+    for (const leaf of candidates) {
+      let row = leaf;
+      for (let i = 0; i < 6 && row; i += 1) {
+        if (row.querySelector?.('span.semi-checkbox')) break;
+        row = row.parentElement;
+      }
+      const control = row?.querySelector('span.semi-checkbox') || row?.querySelector('input[type=checkbox]');
+      if (!control) continue;
+      const input = row?.querySelector('input[type=checkbox]');
+      const alreadyChecked = !!(input?.checked) || control.classList?.contains('semi-checkbox-checked') || control.getAttribute('aria-checked') === 'true';
+      control.scrollIntoView({ block: 'center', inline: 'nearest' });
+      control.setAttribute('data-organizer-folder-checkbox', 'video-page-destination');
+      return { ok: true, controlTag: control.tagName, alreadyChecked };
     }
-    const control = row?.querySelector('span.semi-checkbox') || row?.querySelector('input[type=checkbox]');
-    if (!control) return { ok: false, matches: candidates.length, reason: 'no checkbox in folder row' };
-    const input = row?.querySelector('input[type=checkbox]');
-    const alreadyChecked = !!(input?.checked) || control.classList?.contains('semi-checkbox-checked') || control.getAttribute('aria-checked') === 'true';
-    control.setAttribute('data-organizer-folder-checkbox', 'video-page-destination');
-    return { ok: true, controlTag: control.tagName, alreadyChecked };
+    return { ok: false, matches: candidates.length, reason: 'no checkbox in folder row' };
   })()`);
   if (!marked.ok) return marked;
   if (marked.alreadyChecked) return { ok: true, alreadyCollected: true, skipped: true };
@@ -322,27 +339,56 @@ async function pickFolderAndConfirm(folder, { dryRun = false } = {}) {
   // 2) 真实 CDP 点击勾选（抖音控件忽略 JS 合成 click）
   const clicked = await browser("click", '[data-organizer-folder-checkbox="video-page-destination"]');
   if (!clicked.clicked || clicked.matches_n !== 1) return { ok: false, reason: `checkbox click failed: ${JSON.stringify(clicked)}` };
-  await wait(0.4);
 
-  // 3) 点「保存」按钮（优先 semi-button-primary）
-  const confirm = await evaluate(`(() => {
-    const visible = el => el && (el.offsetWidth || el.offsetHeight);
-    const btn = [...document.querySelectorAll('button')]
-      .find(el => visible(el) && !el.disabled && (el.innerText || '').trim() === '保存')
-      || [...document.querySelectorAll('button')]
-      .find(el => visible(el) && !el.disabled && ['确定', '完成'].includes((el.innerText || '').trim()));
-    if (!btn) return { ok: false, reason: 'no enabled save button' };
-    btn.setAttribute('data-organizer-confirm', 'video-page-destination');
-    return { ok: true, text: btn.innerText.trim() };
+  // 3) 等待「保存」按钮出现（勾选后才出现/启用），真实 CDP 点击保存
+  const save = await waitForSaveButton();
+  if (!save.ok) return save;
+  const saveClicked = await browser("click", '[data-organizer-save="video-page-destination"]');
+  if (!saveClicked.clicked) return { ok: false, reason: `save click failed: ${JSON.stringify(saveClicked)}` };
+  await wait(0.6);
+
+  // 4) 校验：保存后弹窗关闭（semi-checkbox 消失）即视为成功
+  const pickerClosed = await evaluate(`(() => document.querySelectorAll('span.semi-checkbox').length === 0)()`);
+  return { ok: true, collected: true, pickerClosed };
+}
+
+// 等待「保存」按钮出现（勾选目标夹后，弹窗底部才出现/启用「保存」按钮）。
+// 定位：可见、未禁用、文本「保存」的 button（真机确认 class 含 semi-button-primary）。
+async function waitForSaveButton({ timeoutMs = 4000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const marked = await evaluate(`(() => {
+      const visible = el => el && (el.offsetWidth || el.offsetHeight);
+      const btn = [...document.querySelectorAll('button')]
+        .find(el => visible(el) && !el.disabled && (el.innerText || '').trim() === '保存');
+      if (!btn) return { ok: false };
+      btn.setAttribute('data-organizer-save', 'video-page-destination');
+      return { ok: true, text: btn.innerText.trim() };
+    })()`);
+    if (marked.ok) return marked;
+    await sleep(400);
+  }
+  // 超时诊断：dump checkbox 勾选态 + 可见按钮列表，区分「勾选没生效」vs「保存按钮查找失败」
+  const diag = await evaluate(`(() => {
+    const control = document.querySelector('[data-organizer-folder-checkbox="video-page-destination"]');
+    let input = null;
+    let node = control;
+    for (let i = 0; i < 4 && node; i += 1) {
+      const ip = node.querySelector?.('input[type=checkbox]');
+      if (ip) { input = ip; break; }
+      node = node.parentElement;
+    }
+    const btns = [...document.querySelectorAll('button')]
+      .filter(b => b.offsetWidth || b.offsetHeight)
+      .map(b => ({ text: (b.innerText || '').trim(), disabled: !!b.disabled }));
+    return { checked: !!(input?.checked) || control?.classList?.contains('semi-checkbox-checked'), btns };
   })()`);
-  if (!confirm.ok) return confirm;
-  const confirmClick = await browser("click", '[data-organizer-confirm="video-page-destination"]');
-  if (!confirmClick.clicked) return { ok: false, reason: `confirm click failed: ${JSON.stringify(confirmClick)}` };
-  return { ok: true, confirmText: confirm.text, collected: true };
+  return { ok: false, reason: `save button did not appear; checkboxChecked=${diag.checked}; buttons=${JSON.stringify(diag.btns)}` };
 }
 
 // 幂等打开收藏夹选择器并确认弹窗真的打开。
-// 可靠标志：存在 span.semi-checkbox 且存在「保存」按钮（bodyText 含「收藏夹」不可靠，弹窗标题会变）。
+// 可靠标志：存在 span.semi-checkbox（收藏夹列表的勾选控件）。
+// 注意：视频页收藏夹选择器「勾选即收藏」，无「保存」按钮；弹窗标题/文案会变，不能用作标志。
 // 先 ESC 清残留；再点收藏后轮询等待弹窗打开（最多 5s），避免「弹窗正在渲染就被误判未开」。
 async function ensurePickerOpen() {
   await browser("keys", "Escape").catch(() => {});
@@ -353,14 +399,17 @@ async function ensurePickerOpen() {
     let open = false;
     while (Date.now() < deadline) {
       const state = await evaluate(`(() => {
-        const hasCheck = document.querySelectorAll('span.semi-checkbox').length > 0;
-        const hasSave = [...document.querySelectorAll('button')].some(b => (b.offsetWidth || b.offsetHeight) && (b.innerText || '').trim() === '保存');
-        return hasCheck && hasSave;
+        return document.querySelectorAll('span.semi-checkbox').length > 0;
       })()`);
       if (state) { open = true; break; }
       await sleep(500);
     }
-    if (open) return { ok: true, attempt };
+    if (open) {
+      // 弹窗刚检测到 semi-checkbox 时列表/动画可能未稳定，勾选太早会导致保存按钮不出现；
+      // 等待 1.2s 让弹窗充分渲染（与手动诊断的点收藏后 1.8s 一致）。
+      await wait(1.2);
+      return { ok: true, attempt };
+    }
     await browser("keys", "Escape").catch(() => {});
     await wait(0.3);
   }
@@ -469,8 +518,8 @@ async function main() {
           await ensurePickerOpen();
           const picked = await pickFolderAndConfirm(target.folder, { dryRun });
           if (!picked.ok) {
-            process.stderr.write(`${label}   FAIL: ${picked.reason || "unknown"} | anyInDom=${JSON.stringify(picked.anyInDom)} | scrollable=${JSON.stringify(picked.scrollable)}\n`);
-            results.push({ aweme_id: target.aweme_id, status: "failed", reason: picked.reason, folder: target.folder, anyInDom: picked.anyInDom, scrollable: picked.scrollable });
+            process.stderr.write(`${label}   FAIL: ${picked.reason || "unknown"}\n`);
+            results.push({ aweme_id: target.aweme_id, status: "failed", reason: picked.reason, folder: target.folder });
           } else if (picked.alreadyCollected) {
             process.stderr.write(`${label}   ALREADY IN FOLDER (skip)\n`);
             results.push({ aweme_id: target.aweme_id, status: "already-collected", folder: target.folder });
